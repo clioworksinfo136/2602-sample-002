@@ -7,6 +7,11 @@ specifies that any user authenticated via an API key can "create", "read",
 "update", and "delete" any "Todo" records.
 =========================================================================*/
 const schema = a.schema({
+  // One attachment on a Location: its S3 key plus an optional note.
+  PhotoItem: a.customType({
+    key: a.string().required(),
+    note: a.string(),
+  }),
   Project: a
     .model({
       name: a.string().required(),
@@ -19,8 +24,11 @@ const schema = a.schema({
       task: a.string(),
       description: a.string(),
       phase: a.string().required(),
-      // S3 keys of photos/videos attached to this entry.
+      // Legacy: bare S3 keys. Superseded by `photos`, still read as a
+      // fallback so entries attached before notes existed keep working.
       media: a.string().array(),
+      // Attachments with their notes.
+      photos: a.ref("PhotoItem").array(),
     })
     .authorization((allow) => [allow.authenticated()]),
   Date: a

@@ -60,6 +60,20 @@ function errText(err: unknown) {
   return err instanceof Error ? err.message : String(err);
 }
 
+type Attachment = { key: string; note: string };
+
+// Attachments for a row. Prefers `photos` (key + note); falls back to the
+// legacy bare-key `media` list for entries saved before notes existed.
+function attachmentsOf(l: Schema["Location"]["type"]): Attachment[] {
+  const photos = (l.photos ?? [])
+    .filter((p): p is { key: string; note?: string | null } => !!p?.key)
+    .map((p) => ({ key: p.key, note: p.note ?? "" }));
+  if (photos.length > 0) return photos;
+  return (l.media ?? [])
+    .filter((k): k is string => !!k)
+    .map((k) => ({ key: k, note: "" }));
+}
+
 function mediaKind(path: string): MediaItem["kind"] {
   const ext = path.split(".").pop()?.toLowerCase() ?? "";
   if (["jpg", "jpeg", "png", "gif", "webp", "heic", "bmp"].includes(ext))
@@ -262,6 +276,9 @@ function Workspace() {
     index: number;
   } | null>(null);
   const [deletingMedia, setDeletingMedia] = useState(false);
+  // Draft note for the photo open in the lightbox.
+  const [noteDraft, setNoteDraft] = useState("");
+  const [savingNote, setSavingNote] = useState(false);
   const [savingEquipment, setSavingEquipment] = useState(false);
   const [equipForm, setEquipForm] = useState({
     primeSub: "",
@@ -418,7 +435,7 @@ function Workspace() {
   // Media keys held by the rows on screen. Joined into a stable string so the
   // effect below re-runs only when the set of keys actually changes.
   const visibleMediaKeys = dayLocations
-    .flatMap((l) => (l.media ?? []).filter((k): k is string => !!k))
+    .flatMap((l) => attachmentsOf(l).map((a) => a.key))
     .join("|");
 
   useEffect(() => {
@@ -458,10 +475,10 @@ function Workspace() {
   const viewerRow = viewer
     ? locationRows.find((l) => l.id === viewer.locationId)
     : undefined;
-  const viewerKeys = (viewerRow?.media ?? []).filter(
-    (k): k is string => !!k
-  );
+  const viewerAttachments = viewerRow ? attachmentsOf(viewerRow) : [];
+  const viewerKeys = viewerAttachments.map((a) => a.key);
   const viewerItem = viewer ? mediaUrls[viewerKeys[viewer.index]] : undefined;
+  const viewerNote = viewer ? viewerAttachments[viewer.index]?.note ?? "" : "";
 
   const count = viewerKeys.length;
   const stepViewer = useCallback(
@@ -487,6 +504,36 @@ function Workspace() {
     return () => window.removeEventListener("keydown", onKey);
   }, [viewer, stepViewer]);
 
+  // Load the shown photo's note into the editor whenever the slide changes.
+  useEffect(() => {
+    setNoteDraft(viewerNote);
+  }, [viewerNote, viewer?.index, viewer?.locationId]);
+
+  async function saveNote() {
+    if (!viewerRow || !viewer) return;
+    const key = viewerKeys[viewer.index];
+    if (!key) return;
+    setSavingNote(true);
+    try {
+      await client.models.Location.update(
+        {
+          id: viewerRow.id,
+          photos: viewerAttachments.map((a) =>
+            a.key === key ? { ...a, note: noteDraft } : a
+          ),
+          media: [],
+        },
+        AUTH
+      );
+      setMediaError(null);
+      await loadLocations();
+    } catch (err) {
+      setMediaError(`Saving note failed: ${errText(err)}`);
+    } finally {
+      setSavingNote(false);
+    }
+  }
+
   // Detach the shown file from the record, then delete it from S3.
   async function deleteViewerMedia() {
     if (!viewerRow || !viewer) return;
@@ -494,9 +541,9 @@ function Workspace() {
     if (!key) return;
     setDeletingMedia(true);
     try {
-      const remaining = viewerKeys.filter((k) => k !== key);
+      const remaining = viewerAttachments.filter((a) => a.key !== key);
       await client.models.Location.update(
-        { id: viewerRow.id, media: remaining },
+        { id: viewerRow.id, photos: remaining, media: [] },
         AUTH
       );
       await remove({ path: key }).catch(() => undefined);
@@ -683,14 +730,16 @@ function Workspace() {
         }).result;
         keys.push(path);
       }
-      // Only `media` is sent, so task/phase/description are left untouched.
+      // Only attachments are sent, so task/phase/description stay untouched.
+      // Writing `photos` folds in any legacy `media` keys and clears them.
       await client.models.Location.update(
         {
           id,
-          media: [
-            ...(row.media ?? []).filter((k): k is string => !!k),
-            ...keys,
+          photos: [
+            ...attachmentsOf(row),
+            ...keys.map((key) => ({ key, note: "" })),
           ],
+          media: [],
         },
         AUTH
       );
@@ -1292,43 +1341,48 @@ function Workspace() {
                           )}
                         </td>
                       </tr>
-                      {(l.media ?? []).length > 0 && (
+                      {attachmentsOf(l).length > 0 && (
                         <tr className="media-row">
                           <td colSpan={4}>
                             <div className="media-grid">
-                              {(l.media ?? [])
-                                .filter((k): k is string => !!k)
-                                .map((k, i) => [k, i] as const)
-                                .filter(([k]) => mediaUrls[k])
-                                .map(([k, i]) => {
-                                  const m = mediaUrls[k];
+                              {attachmentsOf(l)
+                                .map((a, i) => [a, i] as const)
+                                .filter(([a]) => mediaUrls[a.key])
+                                .map(([a, i]) => {
+                                  const m = mediaUrls[a.key];
                                   return (
-                                    <button
-                                      key={k}
-                                      type="button"
-                                      className="media-thumb"
-                                      onClick={() =>
-                                        setViewer({
-                                          locationId: l.id,
-                                          index: i,
-                                        })
-                                      }
-                                      title="Open"
-                                    >
-                                      {m.kind === "image" ? (
-                                        <img
-                                          src={m.url}
-                                          alt=""
-                                          loading="lazy"
-                                        />
-                                      ) : m.kind === "video" ? (
-                                        <video src={m.url} muted />
-                                      ) : (
-                                        <span className="media-file">
-                                          {m.path.split("/").pop()}
-                                        </span>
+                                    <figure className="media-item" key={a.key}>
+                                      <button
+                                        type="button"
+                                        className="media-thumb"
+                                        onClick={() =>
+                                          setViewer({
+                                            locationId: l.id,
+                                            index: i,
+                                          })
+                                        }
+                                        title={a.note || "Open"}
+                                      >
+                                        {m.kind === "image" ? (
+                                          <img
+                                            src={m.url}
+                                            alt={a.note}
+                                            loading="lazy"
+                                          />
+                                        ) : m.kind === "video" ? (
+                                          <video src={m.url} muted />
+                                        ) : (
+                                          <span className="media-file">
+                                            {m.path.split("/").pop()}
+                                          </span>
+                                        )}
+                                      </button>
+                                      {a.note && (
+                                        <figcaption className="media-caption">
+                                          {a.note}
+                                        </figcaption>
                                       )}
-                                    </button>
+                                    </figure>
                                   );
                                 })}
                             </div>
@@ -1633,6 +1687,22 @@ function Workspace() {
                   </button>
                 </>
               )}
+            </div>
+
+            <div className="lightbox-note">
+              <AutoGrowTextarea
+                value={noteDraft}
+                placeholder="Add a note for this photo…"
+                onChange={(e) => setNoteDraft(e.target.value)}
+              />
+              <button
+                type="button"
+                className="submit-button"
+                onClick={saveNote}
+                disabled={savingNote || noteDraft === viewerNote}
+              >
+                {savingNote ? "Saving…" : "Save note"}
+              </button>
             </div>
 
             <div className="lightbox-bar">
