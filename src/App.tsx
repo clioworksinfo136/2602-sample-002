@@ -1,7 +1,7 @@
 import { Fragment, useCallback, useEffect, useRef, useState } from "react";
 import type { Schema } from "../amplify/data/resource";
 import { generateClient } from "aws-amplify/data";
-import { getUrl, uploadData } from "aws-amplify/storage";
+import { getUrl, remove, uploadData } from "aws-amplify/storage";
 import { Authenticator } from "@aws-amplify/ui-react";
 import "@aws-amplify/ui-react/styles.css";
 
@@ -42,6 +42,23 @@ const START_DATE = "2015-01-01";
 const MEDIA_ROOT = "location-media";
 
 type MediaItem = { path: string; url: string; kind: "image" | "video" | "file" };
+
+// crypto.randomUUID only exists in a secure context, so a phone hitting the
+// dev server over plain http would otherwise throw here.
+function uid() {
+  const c = globalThis.crypto;
+  return typeof c?.randomUUID === "function"
+    ? c.randomUUID()
+    : `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+}
+
+function mediaKeyFor(date: string, file: File) {
+  return `${MEDIA_ROOT}/${date}/${uid()}-${file.name.replace(/[^\w.-]+/g, "_")}`;
+}
+
+function errText(err: unknown) {
+  return err instanceof Error ? err.message : String(err);
+}
 
 function mediaKind(path: string): MediaItem["kind"] {
   const ext = path.split(".").pop()?.toLowerCase() ?? "";
@@ -231,13 +248,20 @@ function Workspace() {
   const [savingLocationEdit, setSavingLocationEdit] = useState(false);
   // Signed URLs for the media keys held by the visible Location rows.
   const [mediaUrls, setMediaUrls] = useState<Record<string, MediaItem>>({});
-  // Files uploaded but not yet attached to a record; Add/Apply commits them.
-  const [pendingMedia, setPendingMedia] = useState<string[]>([]);
-  const [uploading, setUploading] = useState(false);
   const [mediaError, setMediaError] = useState<string | null>(null);
-  const photoInput = useRef<HTMLInputElement>(null);
-  const videoInput = useRef<HTMLInputElement>(null);
-  const fileInput = useRef<HTMLInputElement>(null);
+  // Per-row attach: which Location row the hidden input is acting for.
+  const rowInput = useRef<HTMLInputElement>(null);
+  const rowTarget = useRef<string | null>(null);
+  const [rowUploading, setRowUploading] = useState<string | null>(null);
+  // Row awaiting delete confirmation, and the one currently being deleted.
+  const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null);
+  const [deletingId, setDeletingId] = useState<string | null>(null);
+  // Open lightbox: which Location row, and which of its media we're on.
+  const [viewer, setViewer] = useState<{
+    locationId: string;
+    index: number;
+  } | null>(null);
+  const [deletingMedia, setDeletingMedia] = useState(false);
   const [savingEquipment, setSavingEquipment] = useState(false);
   const [equipForm, setEquipForm] = useState({
     primeSub: "",
@@ -429,6 +453,67 @@ function Workspace() {
     };
   }, [visibleMediaKeys]);
 
+  // Lightbox contents, derived from the row it was opened on so it stays in
+  // step with the record after an attach or a delete.
+  const viewerRow = viewer
+    ? locationRows.find((l) => l.id === viewer.locationId)
+    : undefined;
+  const viewerKeys = (viewerRow?.media ?? []).filter(
+    (k): k is string => !!k
+  );
+  const viewerItem = viewer ? mediaUrls[viewerKeys[viewer.index]] : undefined;
+
+  const count = viewerKeys.length;
+  const stepViewer = useCallback(
+    (delta: number) => {
+      setViewer((v) =>
+        !v || count === 0
+          ? null
+          : { ...v, index: (v.index + delta + count) % count }
+      );
+    },
+    [count]
+  );
+
+  // Arrow keys cycle, Escape closes.
+  useEffect(() => {
+    if (!viewer) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") setViewer(null);
+      else if (e.key === "ArrowRight") stepViewer(1);
+      else if (e.key === "ArrowLeft") stepViewer(-1);
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [viewer, stepViewer]);
+
+  // Detach the shown file from the record, then delete it from S3.
+  async function deleteViewerMedia() {
+    if (!viewerRow || !viewer) return;
+    const key = viewerKeys[viewer.index];
+    if (!key) return;
+    setDeletingMedia(true);
+    try {
+      const remaining = viewerKeys.filter((k) => k !== key);
+      await client.models.Location.update(
+        { id: viewerRow.id, media: remaining },
+        AUTH
+      );
+      await remove({ path: key }).catch(() => undefined);
+      setMediaError(null);
+      await loadLocations();
+      setViewer((v) =>
+        !v || remaining.length === 0
+          ? null
+          : { ...v, index: Math.min(v.index, remaining.length - 1) }
+      );
+    } catch (err) {
+      setMediaError(`Delete failed: ${errText(err)}`);
+    } finally {
+      setDeletingMedia(false);
+    }
+  }
+
   // The saved Location for this date and task. Drives the Description Apply.
   const currentLocation = locationRows.find(
     (l) => l.date === selected && (l.task ?? "") === form.task
@@ -536,7 +621,6 @@ function Workspace() {
           task: form.task || undefined,
           description: form.description || undefined,
           phase: form.phase,
-          media: pendingMedia.length > 0 ? pendingMedia : undefined,
         },
         AUTH
       );
@@ -545,7 +629,6 @@ function Workspace() {
         task: taskRows[0]?.task ?? "",
         description: "",
       }));
-      setPendingMedia([]);
       await loadLocations();
     } finally {
       setSavingLocation(false);
@@ -563,33 +646,36 @@ function Workspace() {
           task: form.task || null,
           description: form.description || null,
           phase: form.phase,
-          // Keep what's already attached and add anything newly uploaded.
-          media: [
-            ...(currentLocation.media ?? []).filter((k): k is string => !!k),
-            ...pendingMedia,
-          ],
+          // media is deliberately omitted: an omitted field is left unchanged,
+          // so Apply can never disturb a row's attachments.
         },
         AUTH
       );
-      setPendingMedia([]);
       await loadLocations();
     } finally {
       setApplyingLocation(false);
     }
   }
 
-  // Photo / Video / Upload all funnel here; they differ only in which hidden
-  // input fired, and whether that input asks the device for the camera.
-  async function handleUpload(event: React.ChangeEvent<HTMLInputElement>) {
+  // Attach files straight onto one saved Location row, by id. Independent of
+  // the form above, so it works whatever the Task dropdown happens to show.
+  function pickRowMedia(id: string) {
+    rowTarget.current = id;
+    rowInput.current?.click();
+  }
+
+  async function handleRowUpload(event: React.ChangeEvent<HTMLInputElement>) {
     const files = Array.from(event.target.files ?? []);
-    event.target.value = ""; // let the same file be picked again
-    if (files.length === 0) return;
-    setUploading(true);
+    event.target.value = "";
+    const id = rowTarget.current;
+    rowTarget.current = null;
+    const row = locationRows.find((l) => l.id === id);
+    if (!id || !row || files.length === 0) return;
+    setRowUploading(id);
     try {
       const keys: string[] = [];
       for (const file of files) {
-        const safeName = file.name.replace(/[^\w.-]+/g, "_");
-        const path = `${MEDIA_ROOT}/${selected}/${crypto.randomUUID()}-${safeName}`;
+        const path = mediaKeyFor(row.date, file);
         await uploadData({
           path,
           data: file,
@@ -597,12 +683,43 @@ function Workspace() {
         }).result;
         keys.push(path);
       }
-      setPendingMedia((p) => [...p, ...keys]);
+      // Only `media` is sent, so task/phase/description are left untouched.
+      await client.models.Location.update(
+        {
+          id,
+          media: [
+            ...(row.media ?? []).filter((k): k is string => !!k),
+            ...keys,
+          ],
+        },
+        AUTH
+      );
       setMediaError(null);
-    } catch {
-      setMediaError("Upload failed. Deploy the backend storage and try again.");
+      await loadLocations();
+    } catch (err) {
+      setMediaError(`Attach failed: ${errText(err)}`);
     } finally {
-      setUploading(false);
+      setRowUploading(null);
+    }
+  }
+
+  // Removes the record, then best-effort deletes its attachments so they
+  // don't linger in S3 unreachable. A failed file delete won't block the row.
+  async function deleteLocation(l: Schema["Location"]["type"]) {
+    setDeletingId(l.id);
+    try {
+      await client.models.Location.delete({ id: l.id }, AUTH);
+      const keys = (l.media ?? []).filter((k): k is string => !!k);
+      await Promise.all(
+        keys.map((path) => remove({ path }).catch(() => undefined))
+      );
+      setConfirmDeleteId(null);
+      setMediaError(null);
+      await loadLocations();
+    } catch (err) {
+      setMediaError(`Delete failed: ${errText(err)}`);
+    } finally {
+      setDeletingId(null);
     }
   }
 
@@ -1015,64 +1132,19 @@ function Workspace() {
             </div>
           </div>
 
-          {/* Capture/attach media for this date + task. The hidden inputs do
-              the work; "capture" asks a phone for the camera directly. */}
-          <div className="media-bar">
-            <input
-              ref={photoInput}
-              type="file"
-              accept="image/*"
-              capture="environment"
-              hidden
-              onChange={handleUpload}
-            />
-            <input
-              ref={videoInput}
-              type="file"
-              accept="video/*"
-              capture="environment"
-              hidden
-              onChange={handleUpload}
-            />
-            <input
-              ref={fileInput}
-              type="file"
-              multiple
-              hidden
-              onChange={handleUpload}
-            />
-            <button
-              type="button"
-              className="submit-button"
-              onClick={() => photoInput.current?.click()}
-              disabled={uploading}
-            >
-              Photo
-            </button>
-            <button
-              type="button"
-              className="submit-button"
-              onClick={() => videoInput.current?.click()}
-              disabled={uploading}
-            >
-              Video
-            </button>
-            <button
-              type="button"
-              className="submit-button"
-              onClick={() => fileInput.current?.click()}
-              disabled={uploading}
-            >
-              {uploading ? "Uploading…" : "Upload"}
-            </button>
-            <span className="media-note">
-              {mediaError ??
-                (pendingMedia.length > 0
-                  ? `${pendingMedia.length} file(s) ready — Add or Apply to attach`
-                  : "Capture or pick files, then Add or Apply to attach them")}
-            </span>
-          </div>
         </form>
+
+        {mediaError && <p className="media-note">{mediaError}</p>}
+
+        {/* Shared by every row's "+ Photo" button; pickRowMedia sets the target. */}
+        <input
+          ref={rowInput}
+          type="file"
+          accept="image/*,video/*"
+          multiple
+          hidden
+          onChange={handleRowUpload}
+        />
 
         {dayLocations.length > 0 && (
           <div className="table-scroll">
@@ -1164,12 +1236,60 @@ function Workspace() {
                         <td className="row-actions">
                           <button
                             type="button"
+                            className="submit-button"
+                            onClick={() => pickRowMedia(l.id)}
+                            disabled={rowUploading !== null}
+                            title="Attach a photo or video to this entry"
+                          >
+                            {rowUploading === l.id ? "Adding…" : "+ Photo"}
+                          </button>
+                          <button
+                            type="button"
                             className="link-button"
                             onClick={() => startEditLocation(l)}
                             disabled={editingLocationId !== null}
                           >
                             Edit
                           </button>
+                          {confirmDeleteId === l.id ? (
+                            <>
+                              <button
+                                type="button"
+                                className="submit-button danger-button"
+                                onClick={() => deleteLocation(l)}
+                                disabled={deletingId !== null}
+                                title={
+                                  (l.media ?? []).length > 0
+                                    ? "Deletes this entry and its attachments"
+                                    : "Deletes this entry"
+                                }
+                              >
+                                {deletingId === l.id
+                                  ? "Deleting…"
+                                  : "Confirm delete"}
+                              </button>
+                              <button
+                                type="button"
+                                className="link-button"
+                                onClick={() => setConfirmDeleteId(null)}
+                                disabled={deletingId !== null}
+                              >
+                                Cancel
+                              </button>
+                            </>
+                          ) : (
+                            <button
+                              type="button"
+                              className="link-button"
+                              onClick={() => setConfirmDeleteId(l.id)}
+                              disabled={
+                                editingLocationId !== null ||
+                                confirmDeleteId !== null
+                              }
+                            >
+                              Delete
+                            </button>
+                          )}
                         </td>
                       </tr>
                       {(l.media ?? []).length > 0 && (
@@ -1178,32 +1298,39 @@ function Workspace() {
                             <div className="media-grid">
                               {(l.media ?? [])
                                 .filter((k): k is string => !!k)
-                                .map((k) => mediaUrls[k])
-                                .filter(Boolean)
-                                .map((m) =>
-                                m.kind === "image" ? (
-                                  <a
-                                    key={m.path}
-                                    href={m.url}
-                                    target="_blank"
-                                    rel="noreferrer"
-                                  >
-                                    <img src={m.url} alt="" loading="lazy" />
-                                  </a>
-                                ) : m.kind === "video" ? (
-                                  <video key={m.path} src={m.url} controls />
-                                ) : (
-                                  <a
-                                    key={m.path}
-                                    href={m.url}
-                                    target="_blank"
-                                    rel="noreferrer"
-                                    className="media-file"
-                                  >
-                                    {m.path.split("/").pop()}
-                                  </a>
-                                )
-                              )}
+                                .map((k, i) => [k, i] as const)
+                                .filter(([k]) => mediaUrls[k])
+                                .map(([k, i]) => {
+                                  const m = mediaUrls[k];
+                                  return (
+                                    <button
+                                      key={k}
+                                      type="button"
+                                      className="media-thumb"
+                                      onClick={() =>
+                                        setViewer({
+                                          locationId: l.id,
+                                          index: i,
+                                        })
+                                      }
+                                      title="Open"
+                                    >
+                                      {m.kind === "image" ? (
+                                        <img
+                                          src={m.url}
+                                          alt=""
+                                          loading="lazy"
+                                        />
+                                      ) : m.kind === "video" ? (
+                                        <video src={m.url} muted />
+                                      ) : (
+                                        <span className="media-file">
+                                          {m.path.split("/").pop()}
+                                        </span>
+                                      )}
+                                    </button>
+                                  );
+                                })}
                             </div>
                           </td>
                         </tr>
@@ -1464,6 +1591,73 @@ function Workspace() {
           <p className="empty-note">No entries yet.</p>
         )}
       </section>
+      )}
+
+      {viewer && viewerItem && (
+        <div
+          className="lightbox"
+          role="dialog"
+          aria-modal="true"
+          onClick={() => setViewer(null)}
+        >
+          {/* Stop clicks inside the frame from closing the overlay. */}
+          <div className="lightbox-frame" onClick={(e) => e.stopPropagation()}>
+            <div className="lightbox-stage">
+              {viewerItem.kind === "video" ? (
+                <video src={viewerItem.url} controls autoPlay />
+              ) : viewerItem.kind === "image" ? (
+                <img src={viewerItem.url} alt="" />
+              ) : (
+                <a href={viewerItem.url} target="_blank" rel="noreferrer">
+                  {viewerItem.path.split("/").pop()}
+                </a>
+              )}
+
+              {count > 1 && (
+                <>
+                  <button
+                    type="button"
+                    className="lightbox-nav lightbox-nav--prev"
+                    onClick={() => stepViewer(-1)}
+                    aria-label="Previous"
+                  >
+                    &#8249;
+                  </button>
+                  <button
+                    type="button"
+                    className="lightbox-nav lightbox-nav--next"
+                    onClick={() => stepViewer(1)}
+                    aria-label="Next"
+                  >
+                    &#8250;
+                  </button>
+                </>
+              )}
+            </div>
+
+            <div className="lightbox-bar">
+              <span className="lightbox-count">
+                {viewer.index + 1} / {count}
+              </span>
+              <button
+                type="button"
+                className="submit-button danger-button"
+                onClick={deleteViewerMedia}
+                disabled={deletingMedia}
+              >
+                {deletingMedia ? "Deleting…" : "Delete photo"}
+              </button>
+              <button
+                type="button"
+                className="link-button"
+                onClick={() => setViewer(null)}
+                disabled={deletingMedia}
+              >
+                Close
+              </button>
+            </div>
+          </div>
+        </div>
       )}
     </main>
   );
