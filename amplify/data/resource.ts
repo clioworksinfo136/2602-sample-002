@@ -19,6 +19,8 @@ const schema = a.schema({
       task: a.string(),
       description: a.string(),
       phase: a.string().required(),
+      // S3 keys of photos/videos attached to this entry.
+      media: a.string().array(),
     })
     .authorization((allow) => [allow.authenticated()]),
   Date: a

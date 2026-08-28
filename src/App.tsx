@@ -1,7 +1,7 @@
 import { Fragment, useCallback, useEffect, useRef, useState } from "react";
 import type { Schema } from "../amplify/data/resource";
 import { generateClient } from "aws-amplify/data";
-import { getUrl, list, uploadData } from "aws-amplify/storage";
+import { getUrl, uploadData } from "aws-amplify/storage";
 import { Authenticator } from "@aws-amplify/ui-react";
 import "@aws-amplify/ui-react/styles.css";
 
@@ -37,23 +37,9 @@ function todayISO() {
 // so start here to land on a month that has entries.
 const START_DATE = "2015-01-01";
 
-// Media lives under location-media/{date}/{task-slug}/, pairing a file with a
-// Location the same way the Apply button does (date + task).
+// Uploads land here; the S3 key is then stored on the Location record itself,
+// so the link survives renaming a task and duplicate rows own their own files.
 const MEDIA_ROOT = "location-media";
-
-function taskSlug(task: string) {
-  return (
-    task
-      .trim()
-      .toLowerCase()
-      .replace(/[^a-z0-9]+/g, "-")
-      .replace(/^-+|-+$/g, "") || "untasked"
-  );
-}
-
-function mediaPrefix(date: string, task: string) {
-  return `${MEDIA_ROOT}/${date}/${taskSlug(task)}/`;
-}
 
 type MediaItem = { path: string; url: string; kind: "image" | "video" | "file" };
 
@@ -243,8 +229,10 @@ function Workspace() {
     description: "",
   });
   const [savingLocationEdit, setSavingLocationEdit] = useState(false);
-  // Uploaded media for the selected date, grouped by task slug.
-  const [dayMedia, setDayMedia] = useState<Record<string, MediaItem[]>>({});
+  // Signed URLs for the media keys held by the visible Location rows.
+  const [mediaUrls, setMediaUrls] = useState<Record<string, MediaItem>>({});
+  // Files uploaded but not yet attached to a record; Add/Apply commits them.
+  const [pendingMedia, setPendingMedia] = useState<string[]>([]);
   const [uploading, setUploading] = useState(false);
   const [mediaError, setMediaError] = useState<string | null>(null);
   const photoInput = useRef<HTMLInputElement>(null);
@@ -369,34 +357,6 @@ function Workspace() {
     setLocationRows(data);
   }, []);
 
-  // Every file stored under the selected date, grouped by task slug. One list
-  // call covers the whole day. Storage may not be deployed yet, so failures
-  // here are surfaced rather than thrown.
-  const loadMedia = useCallback(async (date: string) => {
-    try {
-      const { items } = await list({ path: `${MEDIA_ROOT}/${date}/` });
-      const resolved = await Promise.all(
-        items
-          .filter((it) => !it.path.endsWith("/"))
-          .map(async (it) => ({
-            path: it.path,
-            url: (await getUrl({ path: it.path })).url.toString(),
-            kind: mediaKind(it.path),
-          }))
-      );
-      const grouped: Record<string, MediaItem[]> = {};
-      for (const m of resolved) {
-        const slug = m.path.split("/")[2] ?? "";
-        (grouped[slug] ??= []).push(m);
-      }
-      setDayMedia(grouped);
-      setMediaError(null);
-    } catch {
-      setDayMedia({});
-      setMediaError("Storage is not available. Deploy the backend to enable uploads.");
-    }
-  }, []);
-
   useEffect(() => {
     loadDateDays();
     loadEntries();
@@ -405,9 +365,6 @@ function Workspace() {
     loadLocations();
   }, [loadDateDays, loadEntries, loadTasks, loadEquipment, loadLocations]);
 
-  useEffect(() => {
-    loadMedia(selected);
-  }, [selected, loadMedia]);
 
   // Equipment picker options, one per Equipment entry. Shown slash-separated;
   // Insert writes the comma-separated form. Derived from the rows so edits
@@ -433,6 +390,44 @@ function Workspace() {
   const dayLocations = locationRows
     .filter((l) => l.date === selected)
     .sort((a, b) => (a.task ?? "").localeCompare(b.task ?? ""));
+
+  // Media keys held by the rows on screen. Joined into a stable string so the
+  // effect below re-runs only when the set of keys actually changes.
+  const visibleMediaKeys = dayLocations
+    .flatMap((l) => (l.media ?? []).filter((k): k is string => !!k))
+    .join("|");
+
+  useEffect(() => {
+    let cancelled = false;
+    const keys = visibleMediaKeys ? visibleMediaKeys.split("|") : [];
+    if (keys.length === 0) {
+      setMediaUrls({});
+      return;
+    }
+    (async () => {
+      try {
+        const resolved = await Promise.all(
+          keys.map(
+            async (k) =>
+              [
+                k,
+                {
+                  path: k,
+                  url: (await getUrl({ path: k })).url.toString(),
+                  kind: mediaKind(k),
+                },
+              ] as const
+          )
+        );
+        if (!cancelled) setMediaUrls(Object.fromEntries(resolved));
+      } catch {
+        if (!cancelled) setMediaUrls({});
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [visibleMediaKeys]);
 
   // The saved Location for this date and task. Drives the Description Apply.
   const currentLocation = locationRows.find(
@@ -541,6 +536,7 @@ function Workspace() {
           task: form.task || undefined,
           description: form.description || undefined,
           phase: form.phase,
+          media: pendingMedia.length > 0 ? pendingMedia : undefined,
         },
         AUTH
       );
@@ -549,6 +545,7 @@ function Workspace() {
         task: taskRows[0]?.task ?? "",
         description: "",
       }));
+      setPendingMedia([]);
       await loadLocations();
     } finally {
       setSavingLocation(false);
@@ -566,9 +563,15 @@ function Workspace() {
           task: form.task || null,
           description: form.description || null,
           phase: form.phase,
+          // Keep what's already attached and add anything newly uploaded.
+          media: [
+            ...(currentLocation.media ?? []).filter((k): k is string => !!k),
+            ...pendingMedia,
+          ],
         },
         AUTH
       );
+      setPendingMedia([]);
       await loadLocations();
     } finally {
       setApplyingLocation(false);
@@ -583,15 +586,19 @@ function Workspace() {
     if (files.length === 0) return;
     setUploading(true);
     try {
+      const keys: string[] = [];
       for (const file of files) {
         const safeName = file.name.replace(/[^\w.-]+/g, "_");
+        const path = `${MEDIA_ROOT}/${selected}/${crypto.randomUUID()}-${safeName}`;
         await uploadData({
-          path: `${mediaPrefix(selected, form.task)}${Date.now()}-${safeName}`,
+          path,
           data: file,
           options: { contentType: file.type || undefined },
         }).result;
+        keys.push(path);
       }
-      await loadMedia(selected);
+      setPendingMedia((p) => [...p, ...keys]);
+      setMediaError(null);
     } catch {
       setMediaError("Upload failed. Deploy the backend storage and try again.");
     } finally {
@@ -1059,7 +1066,10 @@ function Workspace() {
               {uploading ? "Uploading…" : "Upload"}
             </button>
             <span className="media-note">
-              {mediaError ?? `Attaches to ${selected} · ${form.task || "—"}`}
+              {mediaError ??
+                (pendingMedia.length > 0
+                  ? `${pendingMedia.length} file(s) ready — Add or Apply to attach`
+                  : "Capture or pick files, then Add or Apply to attach them")}
             </span>
           </div>
         </form>
@@ -1162,11 +1172,15 @@ function Workspace() {
                           </button>
                         </td>
                       </tr>
-                      {(dayMedia[taskSlug(l.task ?? "")] ?? []).length > 0 && (
+                      {(l.media ?? []).length > 0 && (
                         <tr className="media-row">
                           <td colSpan={4}>
                             <div className="media-grid">
-                              {dayMedia[taskSlug(l.task ?? "")].map((m) =>
+                              {(l.media ?? [])
+                                .filter((k): k is string => !!k)
+                                .map((k) => mediaUrls[k])
+                                .filter(Boolean)
+                                .map((m) =>
                                 m.kind === "image" ? (
                                   <a
                                     key={m.path}
