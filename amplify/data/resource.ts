@@ -7,11 +7,48 @@ specifies that any user authenticated via an API key can "create", "read",
 "update", and "delete" any "Todo" records.
 =========================================================================*/
 const schema = a.schema({
-  Todo: a
+  Project: a
     .model({
-      content: a.string(),
+      name: a.string().required(),
+      number: a.string(),
     })
     .authorization((allow) => [allow.publicApiKey()]),
+  Location: a
+    .model({
+      date: a.date().required(),
+      task: a.string(),
+      description: a.string(),
+      phase: a.string().required(),
+    })
+    .authorization((allow) => [allow.authenticated()]),
+  Date: a
+    .model({
+      date: a.date(),
+      weather: a.string(),
+      hight: a.float(),
+      lowt: a.float(),
+      supervisor: a.string(),
+      inspector: a.string(),
+      labor: a.integer(),
+      observation: a.string(),
+      equipment: a.string(),
+    })
+    .authorization((allow) => [allow.authenticated()]),
+
+  Task: a
+    .model({
+      taskid: a.string(),
+      task: a.string(),
+    })
+    .authorization((allow) => [allow.authenticated()]),
+
+  Equipment: a
+    .model({
+      primeSub: a.string(),
+      model: a.string(),
+      equipment: a.string(),
+    })
+    .authorization((allow) => [allow.authenticated()]),  
 });
 
 export type Schema = ClientSchema<typeof schema>;
