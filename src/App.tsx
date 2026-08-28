@@ -1,6 +1,7 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { Fragment, useCallback, useEffect, useRef, useState } from "react";
 import type { Schema } from "../amplify/data/resource";
 import { generateClient } from "aws-amplify/data";
+import { getUrl, list, uploadData } from "aws-amplify/storage";
 import { Authenticator } from "@aws-amplify/ui-react";
 import "@aws-amplify/ui-react/styles.css";
 
@@ -13,6 +14,12 @@ const MONTHS = [
   "July", "August", "September", "October", "November", "December",
 ];
 const WEEKDAYS = ["Su", "Mo", "Tu", "We", "Th", "Fr", "Sa"];
+const PHASES = [
+  "Assessment (Design Phase)",
+  "Preconstruction",
+  "During Construction",
+  "After Construction",
+];
 
 function iso(year: number, month0: number, day: number) {
   return `${year}-${String(month0 + 1).padStart(2, "0")}-${String(day).padStart(
@@ -24,6 +31,73 @@ function iso(year: number, month0: number, day: number) {
 function todayISO() {
   const d = new Date();
   return iso(d.getFullYear(), d.getMonth(), d.getDate());
+}
+
+// Date the app opens on (calendar view + selected date). Data spans 2014-2015,
+// so start here to land on a month that has entries.
+const START_DATE = "2015-01-01";
+
+// Media lives under location-media/{date}/{task-slug}/, pairing a file with a
+// Location the same way the Apply button does (date + task).
+const MEDIA_ROOT = "location-media";
+
+function taskSlug(task: string) {
+  return (
+    task
+      .trim()
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, "-")
+      .replace(/^-+|-+$/g, "") || "untasked"
+  );
+}
+
+function mediaPrefix(date: string, task: string) {
+  return `${MEDIA_ROOT}/${date}/${taskSlug(task)}/`;
+}
+
+type MediaItem = { path: string; url: string; kind: "image" | "video" | "file" };
+
+function mediaKind(path: string): MediaItem["kind"] {
+  const ext = path.split(".").pop()?.toLowerCase() ?? "";
+  if (["jpg", "jpeg", "png", "gif", "webp", "heic", "bmp"].includes(ext))
+    return "image";
+  if (["mp4", "mov", "webm", "m4v", "avi"].includes(ext)) return "video";
+  return "file";
+}
+
+// list() returns a single page (100 rows by default), so follow nextToken to
+// be sure every saved row is loaded.
+async function listAll<T>(
+  fetchPage: (nextToken?: string) => Promise<{
+    data: T[];
+    nextToken?: string | null;
+  }>
+): Promise<T[]> {
+  const all: T[] = [];
+  let token: string | undefined;
+  do {
+    const page = await fetchPage(token);
+    all.push(...page.data);
+    token = page.nextToken ?? undefined;
+  } while (token);
+  return all;
+}
+
+// The Equipment field is a flat comma-separated list, so an inserted entry is
+// a run of several parts rather than a single one.
+function splitParts(value: string) {
+  return value
+    .split(",")
+    .map((p) => p.trim().toLowerCase())
+    .filter(Boolean);
+}
+
+// Is `addition` already in `current` as a contiguous run of parts?
+function hasParts(current: string, addition: string) {
+  const cur = splitParts(current);
+  const add = splitParts(addition);
+  if (add.length === 0) return false;
+  return cur.some((_, i) => add.every((a, j) => cur[i + j] === a));
 }
 
 type CalendarProps = {
@@ -142,7 +216,7 @@ const DEFAULT_FORM = {
 };
 
 function Workspace() {
-  const [selected, setSelected] = useState(todayISO());
+  const [selected, setSelected] = useState(START_DATE);
   const [calendarOpen, setCalendarOpen] = useState(false);
   const [dateDays, setDateDays] = useState<Set<string>>(new Set());
   const [entries, setEntries] = useState<Array<Schema["Date"]["type"]>>([]);
@@ -150,23 +224,57 @@ function Workspace() {
   const [equipmentRows, setEquipmentRows] = useState<
     Array<Schema["Equipment"]["type"]>
   >([]);
+  const [locationRows, setLocationRows] = useState<
+    Array<Schema["Location"]["type"]>
+  >([]);
 
   const [form, setForm] = useState(DEFAULT_FORM);
   const [saving, setSaving] = useState(false);
+  const [applying, setApplying] = useState(false);
   const [savingLocation, setSavingLocation] = useState(false);
+  const [applyingLocation, setApplyingLocation] = useState(false);
+  // Row currently open for editing in the Location list, plus its draft values.
+  const [editingLocationId, setEditingLocationId] = useState<string | null>(
+    null
+  );
+  const [locationEdit, setLocationEdit] = useState({
+    task: "",
+    phase: "",
+    description: "",
+  });
+  const [savingLocationEdit, setSavingLocationEdit] = useState(false);
+  // Uploaded media for the selected date, grouped by task slug.
+  const [dayMedia, setDayMedia] = useState<Record<string, MediaItem[]>>({});
+  const [uploading, setUploading] = useState(false);
+  const [mediaError, setMediaError] = useState<string | null>(null);
+  const photoInput = useRef<HTMLInputElement>(null);
+  const videoInput = useRef<HTMLInputElement>(null);
+  const fileInput = useRef<HTMLInputElement>(null);
   const [savingEquipment, setSavingEquipment] = useState(false);
   const [equipForm, setEquipForm] = useState({
     primeSub: "",
     model: "",
     equipment: "",
   });
+  // Row currently open for editing in the Equipment table, plus its draft values.
+  const [editingEquipId, setEditingEquipId] = useState<string | null>(null);
+  const [equipEdit, setEquipEdit] = useState({
+    primeSub: "",
+    model: "",
+    equipment: "",
+  });
+  const [savingEquipEdit, setSavingEquipEdit] = useState(false);
   const [savingTask, setSavingTask] = useState(false);
   const [taskForm, setTaskForm] = useState({ taskid: "", task: "" });
+  // Row currently open for editing in the Task table, plus its draft values.
+  const [editingTaskId, setEditingTaskId] = useState<string | null>(null);
+  const [taskEdit, setTaskEdit] = useState({ taskid: "", task: "" });
+  const [savingTaskEdit, setSavingTaskEdit] = useState(false);
   // Table visibility switches (both off on startup).
   const [showTask, setShowTask] = useState(false);
   const [showEquipment, setShowEquipment] = useState(false);
-  // Equipment dropdown options, seeded from the Equipment model.
-  const [equipmentOptions, setEquipmentOptions] = useState<string[]>([]);
+  // Equipment picker selection. Only lands in the form when Insert is clicked.
+  const [equipPick, setEquipPick] = useState("");
   const update = (key: keyof typeof DEFAULT_FORM, value: string) =>
     setForm((s) => ({ ...s, [key]: value }));
 
@@ -212,13 +320,17 @@ function Workspace() {
 
   // Every date that has at least one Date entry -> highlighted on the calendar.
   const loadDateDays = useCallback(async () => {
-    const { data } = await client.models.Date.list(AUTH);
+    const data = await listAll((nextToken) =>
+      client.models.Date.list({ ...AUTH, nextToken })
+    );
     setDateDays(new Set(data.map((d) => d.date).filter(Boolean) as string[]));
   }, []);
 
   // All Date entries, newest first.
   const loadEntries = useCallback(async () => {
-    const { data } = await client.models.Date.list(AUTH);
+    const data = await listAll((nextToken) =>
+      client.models.Date.list({ ...AUTH, nextToken })
+    );
     setEntries(
       [...data].sort((a, b) => (b.date ?? "").localeCompare(a.date ?? ""))
     );
@@ -226,7 +338,9 @@ function Workspace() {
 
   // All Task entries, sorted by Task ID.
   const loadTasks = useCallback(async () => {
-    const { data } = await client.models.Task.list(AUTH);
+    const data = await listAll((nextToken) =>
+      client.models.Task.list({ ...AUTH, nextToken })
+    );
     const sorted = [...data].sort((a, b) =>
       (a.taskid ?? "").localeCompare(b.taskid ?? "")
     );
@@ -237,12 +351,50 @@ function Workspace() {
 
   // All Equipment entries; also seeds the Equipment dropdown.
   const loadEquipment = useCallback(async () => {
-    const { data } = await client.models.Equipment.list(AUTH);
-    setEquipmentRows(data);
-    const names = data
-      .map((e) => e.equipment)
-      .filter((n): n is string => !!n);
-    setEquipmentOptions(Array.from(new Set(names)));
+    const data = await listAll((nextToken) =>
+      client.models.Equipment.list({ ...AUTH, nextToken })
+    );
+    setEquipmentRows(
+      [...data].sort((a, b) =>
+        (a.primeSub ?? "").localeCompare(b.primeSub ?? "")
+      )
+    );
+  }, []);
+
+  // Location entries, so Apply can find the one to update.
+  const loadLocations = useCallback(async () => {
+    const data = await listAll((nextToken) =>
+      client.models.Location.list({ ...AUTH, nextToken })
+    );
+    setLocationRows(data);
+  }, []);
+
+  // Every file stored under the selected date, grouped by task slug. One list
+  // call covers the whole day. Storage may not be deployed yet, so failures
+  // here are surfaced rather than thrown.
+  const loadMedia = useCallback(async (date: string) => {
+    try {
+      const { items } = await list({ path: `${MEDIA_ROOT}/${date}/` });
+      const resolved = await Promise.all(
+        items
+          .filter((it) => !it.path.endsWith("/"))
+          .map(async (it) => ({
+            path: it.path,
+            url: (await getUrl({ path: it.path })).url.toString(),
+            kind: mediaKind(it.path),
+          }))
+      );
+      const grouped: Record<string, MediaItem[]> = {};
+      for (const m of resolved) {
+        const slug = m.path.split("/")[2] ?? "";
+        (grouped[slug] ??= []).push(m);
+      }
+      setDayMedia(grouped);
+      setMediaError(null);
+    } catch {
+      setDayMedia({});
+      setMediaError("Storage is not available. Deploy the backend to enable uploads.");
+    }
   }, []);
 
   useEffect(() => {
@@ -250,7 +402,81 @@ function Workspace() {
     loadEntries();
     loadTasks();
     loadEquipment();
-  }, [loadDateDays, loadEntries, loadTasks, loadEquipment]);
+    loadLocations();
+  }, [loadDateDays, loadEntries, loadTasks, loadEquipment, loadLocations]);
+
+  useEffect(() => {
+    loadMedia(selected);
+  }, [selected, loadMedia]);
+
+  // Equipment picker options, one per Equipment entry. Shown slash-separated;
+  // Insert writes the comma-separated form. Derived from the rows so edits
+  // and sorting flow through. Keyed by label so duplicates collapse.
+  const equipmentOptions = Array.from(
+    new Map(
+      equipmentRows
+        .map((eq) => {
+          const fields = [eq.primeSub, eq.model, eq.equipment]
+            .map((v) => v?.trim())
+            .filter((v): v is string => !!v);
+          return { label: fields.join(" / "), value: fields.join(", ") };
+        })
+        .filter((o) => o.label !== "")
+        .map((o) => [o.label, o] as const)
+    ).values()
+  );
+
+  // The saved record for the selected date, if there is one. Drives Apply.
+  const currentEntry = entries.find((d) => d.date === selected);
+
+  // Every Location saved under the selected date, listed by task.
+  const dayLocations = locationRows
+    .filter((l) => l.date === selected)
+    .sort((a, b) => (a.task ?? "").localeCompare(b.task ?? ""));
+
+  // The saved Location for this date and task. Drives the Description Apply.
+  const currentLocation = locationRows.find(
+    (l) => l.date === selected && (l.task ?? "") === form.task
+  );
+
+  const pickedOption = equipmentOptions.find((o) => o.label === equipPick);
+  // Already in the box? Then Insert is a no-op and the button is disabled.
+  const pickedAlreadyAdded =
+    !!pickedOption && hasParts(form.equipment, pickedOption.value);
+
+  // Append the picked entry to whatever the Equipment box already holds,
+  // skipping it if that entry is already listed.
+  function insertEquipment() {
+    if (!pickedOption) return;
+    setForm((s) =>
+      hasParts(s.equipment, pickedOption.value)
+        ? s
+        : {
+            ...s,
+            equipment: s.equipment
+              ? `${s.equipment}, ${pickedOption.value}`
+              : pickedOption.value,
+          }
+    );
+  }
+
+  // Mirror the selected day's saved entry into the form inputs.
+  // Days with no entry fall back to the blank/default form.
+  useEffect(() => {
+    const entry = entries.find((d) => d.date === selected);
+    const str = (v: unknown) => (v === null || v === undefined ? "" : String(v));
+    setForm((s) => ({
+      ...s,
+      weather: str(entry?.weather),
+      hight: str(entry?.hight),
+      lowt: str(entry?.lowt),
+      supervisor: entry ? str(entry.supervisor) : DEFAULT_FORM.supervisor,
+      inspector: entry ? str(entry.inspector) : DEFAULT_FORM.inspector,
+      labor: str(entry?.labor),
+      observation: str(entry?.observation),
+      equipment: str(entry?.equipment),
+    }));
+  }, [selected, entries]);
 
   async function addEntry(event: React.FormEvent) {
     event.preventDefault();
@@ -278,6 +504,33 @@ function Workspace() {
     }
   }
 
+  // Save the form back onto the selected date's existing Date record.
+  // Blank inputs are sent as null so clearing a box actually clears the field.
+  async function applyEntry() {
+    if (!currentEntry) return;
+    setApplying(true);
+    try {
+      const num = (v: string) => (v.trim() === "" ? null : Number(v));
+      await client.models.Date.update(
+        {
+          id: currentEntry.id,
+          weather: form.weather || null,
+          hight: num(form.hight),
+          lowt: num(form.lowt),
+          supervisor: form.supervisor || null,
+          inspector: form.inspector || null,
+          labor: num(form.labor),
+          observation: form.observation || null,
+          equipment: form.equipment || null,
+        },
+        AUTH
+      );
+      await Promise.all([loadEntries(), loadDateDays()]);
+    } finally {
+      setApplying(false);
+    }
+  }
+
   // Location entry shares the selected date; phase defaults to "During Construction".
   async function addLocation() {
     setSavingLocation(true);
@@ -296,8 +549,86 @@ function Workspace() {
         task: taskRows[0]?.task ?? "",
         description: "",
       }));
+      await loadLocations();
     } finally {
       setSavingLocation(false);
+    }
+  }
+
+  // Save the form back onto the Location already saved for this date + task.
+  async function applyLocation() {
+    if (!currentLocation) return;
+    setApplyingLocation(true);
+    try {
+      await client.models.Location.update(
+        {
+          id: currentLocation.id,
+          task: form.task || null,
+          description: form.description || null,
+          phase: form.phase,
+        },
+        AUTH
+      );
+      await loadLocations();
+    } finally {
+      setApplyingLocation(false);
+    }
+  }
+
+  // Photo / Video / Upload all funnel here; they differ only in which hidden
+  // input fired, and whether that input asks the device for the camera.
+  async function handleUpload(event: React.ChangeEvent<HTMLInputElement>) {
+    const files = Array.from(event.target.files ?? []);
+    event.target.value = ""; // let the same file be picked again
+    if (files.length === 0) return;
+    setUploading(true);
+    try {
+      for (const file of files) {
+        const safeName = file.name.replace(/[^\w.-]+/g, "_");
+        await uploadData({
+          path: `${mediaPrefix(selected, form.task)}${Date.now()}-${safeName}`,
+          data: file,
+          options: { contentType: file.type || undefined },
+        }).result;
+      }
+      await loadMedia(selected);
+    } catch {
+      setMediaError("Upload failed. Deploy the backend storage and try again.");
+    } finally {
+      setUploading(false);
+    }
+  }
+
+  function startEditLocation(l: Schema["Location"]["type"]) {
+    setEditingLocationId(l.id);
+    setLocationEdit({
+      task: l.task ?? "",
+      phase: l.phase ?? PHASES[0],
+      description: l.description ?? "",
+    });
+  }
+
+  function cancelEditLocation() {
+    setEditingLocationId(null);
+  }
+
+  async function saveEditLocation() {
+    if (!editingLocationId) return;
+    setSavingLocationEdit(true);
+    try {
+      await client.models.Location.update(
+        {
+          id: editingLocationId,
+          task: locationEdit.task || null,
+          description: locationEdit.description || null,
+          phase: locationEdit.phase,
+        },
+        AUTH
+      );
+      setEditingLocationId(null);
+      await loadLocations();
+    } finally {
+      setSavingLocationEdit(false);
     }
   }
 
@@ -320,6 +651,39 @@ function Workspace() {
     }
   }
 
+  function startEditEquipment(eq: Schema["Equipment"]["type"]) {
+    setEditingEquipId(eq.id);
+    setEquipEdit({
+      primeSub: eq.primeSub ?? "",
+      model: eq.model ?? "",
+      equipment: eq.equipment ?? "",
+    });
+  }
+
+  function cancelEditEquipment() {
+    setEditingEquipId(null);
+  }
+
+  async function saveEditEquipment() {
+    if (!editingEquipId) return;
+    setSavingEquipEdit(true);
+    try {
+      await client.models.Equipment.update(
+        {
+          id: editingEquipId,
+          primeSub: equipEdit.primeSub || undefined,
+          model: equipEdit.model || undefined,
+          equipment: equipEdit.equipment || undefined,
+        },
+        AUTH
+      );
+      setEditingEquipId(null);
+      await loadEquipment();
+    } finally {
+      setSavingEquipEdit(false);
+    }
+  }
+
   async function addTask(event: React.FormEvent) {
     event.preventDefault();
     setSavingTask(true);
@@ -335,6 +699,34 @@ function Workspace() {
       await loadTasks();
     } finally {
       setSavingTask(false);
+    }
+  }
+
+  function startEditTask(t: Schema["Task"]["type"]) {
+    setEditingTaskId(t.id);
+    setTaskEdit({ taskid: t.taskid ?? "", task: t.task ?? "" });
+  }
+
+  function cancelEditTask() {
+    setEditingTaskId(null);
+  }
+
+  async function saveEditTask() {
+    if (!editingTaskId) return;
+    setSavingTaskEdit(true);
+    try {
+      await client.models.Task.update(
+        {
+          id: editingTaskId,
+          taskid: taskEdit.taskid || undefined,
+          task: taskEdit.task || undefined,
+        },
+        AUTH
+      );
+      setEditingTaskId(null);
+      await loadTasks();
+    } finally {
+      setSavingTaskEdit(false);
     }
   }
 
@@ -373,41 +765,6 @@ function Workspace() {
             {saving ? "Adding…" : "+ Add Date"}
           </button>
         </div>
-
-        {entries.length > 0 && (
-          <div className="table-scroll">
-            <table className="data-table">
-              <thead>
-                <tr>
-                  <th>Date</th>
-                  <th>Weather</th>
-                  <th>High</th>
-                  <th>Low</th>
-                  <th>Supervisor</th>
-                  <th>Inspector</th>
-                  <th>Labor</th>
-                  <th>Observation</th>
-                  <th>Equipment</th>
-                </tr>
-              </thead>
-              <tbody>
-                {entries.map((d) => (
-                  <tr key={d.id}>
-                    <td>{d.date}</td>
-                    <td>{d.weather}</td>
-                    <td>{d.hight}</td>
-                    <td>{d.lowt}</td>
-                    <td>{d.supervisor}</td>
-                    <td>{d.inspector}</td>
-                    <td>{d.labor}</td>
-                    <td>{d.observation}</td>
-                    <td>{d.equipment}</td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-        )}
 
         <form id="date-form" className="date-form" onSubmit={addEntry}>
           <div className="form-row form-row--1">
@@ -489,22 +846,50 @@ function Workspace() {
               onChange={(e) => update("labor", e.target.value)}
             />
           </label>
+          </div>
 
           <label className="field field--equipment">
             <span>Equipment</span>
-            <select
+            <input
               value={form.equipment}
               onChange={(e) => update("equipment", e.target.value)}
-            >
-              <option value="">—</option>
-              {equipmentOptions.map((name) => (
-                <option key={name} value={name}>
-                  {name}
-                </option>
-              ))}
-            </select>
+            />
+            {/* Picker below the box: Insert appends it, Clear empties the box. */}
+            <div className="input-with-action">
+              <select
+                value={equipPick}
+                onChange={(e) => setEquipPick(e.target.value)}
+              >
+                <option value="">—</option>
+                {equipmentOptions.map((o) => (
+                  <option key={o.label} value={o.label}>
+                    {o.label}
+                  </option>
+                ))}
+              </select>
+              <button
+                type="button"
+                className="submit-button"
+                onClick={insertEquipment}
+                disabled={!pickedOption || pickedAlreadyAdded}
+                title={
+                  pickedAlreadyAdded
+                    ? "Already listed in the Equipment field"
+                    : undefined
+                }
+              >
+                {pickedAlreadyAdded ? "Added" : "Insert"}
+              </button>
+              <button
+                type="button"
+                className="link-button"
+                onClick={() => update("equipment", "")}
+                disabled={!form.equipment}
+              >
+                Clear
+              </button>
+            </div>
           </label>
-          </div>
 
           <div className="field field--observation">
             <span>Observation</span>
@@ -528,6 +913,19 @@ function Workspace() {
                 }
               >
                 {listeningField === "observation" ? "■" : "\u{1F3A4}"}
+              </button>
+              <button
+                type="button"
+                className="submit-button"
+                onClick={applyEntry}
+                disabled={!currentEntry || applying}
+                title={
+                  currentEntry
+                    ? "Save these values onto this date's entry"
+                    : "No entry saved for this date yet — use + Add Date"
+                }
+              >
+                {applying ? "Applying…" : "Apply"}
               </button>
             </div>
           </div>
@@ -554,12 +952,11 @@ function Workspace() {
                 required
                 onChange={(e) => update("phase", e.target.value)}
               >
-                <option value="Assessment (Design Phase)">
-                  Assessment (Design Phase)
-                </option>
-                <option value="Preconstruction">Preconstruction</option>
-                <option value="During Construction">During Construction</option>
-                <option value="After Construction">After Construction</option>
+                {PHASES.map((p) => (
+                  <option key={p} value={p}>
+                    {p}
+                  </option>
+                ))}
               </select>
             </label>
           </div>
@@ -595,9 +992,215 @@ function Workspace() {
               >
                 {savingLocation ? "Adding…" : "Add"}
               </button>
+              <button
+                type="button"
+                className="submit-button"
+                onClick={applyLocation}
+                disabled={!currentLocation || applyingLocation}
+                title={
+                  currentLocation
+                    ? "Save these values onto this date's saved entry for this task"
+                    : "Nothing saved yet for this date and task — use Add"
+                }
+              >
+                {applyingLocation ? "Applying…" : "Apply"}
+              </button>
             </div>
           </div>
+
+          {/* Capture/attach media for this date + task. The hidden inputs do
+              the work; "capture" asks a phone for the camera directly. */}
+          <div className="media-bar">
+            <input
+              ref={photoInput}
+              type="file"
+              accept="image/*"
+              capture="environment"
+              hidden
+              onChange={handleUpload}
+            />
+            <input
+              ref={videoInput}
+              type="file"
+              accept="video/*"
+              capture="environment"
+              hidden
+              onChange={handleUpload}
+            />
+            <input
+              ref={fileInput}
+              type="file"
+              multiple
+              hidden
+              onChange={handleUpload}
+            />
+            <button
+              type="button"
+              className="submit-button"
+              onClick={() => photoInput.current?.click()}
+              disabled={uploading}
+            >
+              Photo
+            </button>
+            <button
+              type="button"
+              className="submit-button"
+              onClick={() => videoInput.current?.click()}
+              disabled={uploading}
+            >
+              Video
+            </button>
+            <button
+              type="button"
+              className="submit-button"
+              onClick={() => fileInput.current?.click()}
+              disabled={uploading}
+            >
+              {uploading ? "Uploading…" : "Upload"}
+            </button>
+            <span className="media-note">
+              {mediaError ?? `Attaches to ${selected} · ${form.task || "—"}`}
+            </span>
+          </div>
         </form>
+
+        {dayLocations.length > 0 && (
+          <div className="table-scroll">
+            <table className="data-table">
+              <thead>
+                <tr>
+                  <th>Task</th>
+                  <th>Phase</th>
+                  <th>Description</th>
+                  <th>Edit</th>
+                </tr>
+              </thead>
+              <tbody>
+                {dayLocations.map((l) =>
+                  editingLocationId === l.id ? (
+                    <tr key={l.id}>
+                      <td>
+                        <select
+                          value={locationEdit.task}
+                          onChange={(e) =>
+                            setLocationEdit((s) => ({
+                              ...s,
+                              task: e.target.value,
+                            }))
+                          }
+                        >
+                          {taskRows.map((t) => (
+                            <option key={t.id} value={t.task ?? ""}>
+                              {t.taskid ? `${t.taskid} - ${t.task}` : t.task}
+                            </option>
+                          ))}
+                        </select>
+                      </td>
+                      <td>
+                        <select
+                          value={locationEdit.phase}
+                          onChange={(e) =>
+                            setLocationEdit((s) => ({
+                              ...s,
+                              phase: e.target.value,
+                            }))
+                          }
+                        >
+                          {PHASES.map((p) => (
+                            <option key={p} value={p}>
+                              {p}
+                            </option>
+                          ))}
+                        </select>
+                      </td>
+                      <td className="cell-wrap">
+                        <AutoGrowTextarea
+                          value={locationEdit.description}
+                          onChange={(e) =>
+                            setLocationEdit((s) => ({
+                              ...s,
+                              description: e.target.value,
+                            }))
+                          }
+                        />
+                      </td>
+                      <td className="row-actions">
+                        <button
+                          type="button"
+                          className="submit-button"
+                          onClick={saveEditLocation}
+                          disabled={savingLocationEdit}
+                        >
+                          {savingLocationEdit ? "Saving…" : "Save"}
+                        </button>
+                        <button
+                          type="button"
+                          className="link-button"
+                          onClick={cancelEditLocation}
+                          disabled={savingLocationEdit}
+                        >
+                          Cancel
+                        </button>
+                      </td>
+                    </tr>
+                  ) : (
+                    <Fragment key={l.id}>
+                      <tr>
+                        <td>{l.task}</td>
+                        <td>{l.phase}</td>
+                        <td className="cell-wrap cell-wrap--lines">
+                          {l.description}
+                        </td>
+                        <td className="row-actions">
+                          <button
+                            type="button"
+                            className="link-button"
+                            onClick={() => startEditLocation(l)}
+                            disabled={editingLocationId !== null}
+                          >
+                            Edit
+                          </button>
+                        </td>
+                      </tr>
+                      {(dayMedia[taskSlug(l.task ?? "")] ?? []).length > 0 && (
+                        <tr className="media-row">
+                          <td colSpan={4}>
+                            <div className="media-grid">
+                              {dayMedia[taskSlug(l.task ?? "")].map((m) =>
+                                m.kind === "image" ? (
+                                  <a
+                                    key={m.path}
+                                    href={m.url}
+                                    target="_blank"
+                                    rel="noreferrer"
+                                  >
+                                    <img src={m.url} alt="" loading="lazy" />
+                                  </a>
+                                ) : m.kind === "video" ? (
+                                  <video key={m.path} src={m.url} controls />
+                                ) : (
+                                  <a
+                                    key={m.path}
+                                    href={m.url}
+                                    target="_blank"
+                                    rel="noreferrer"
+                                    className="media-file"
+                                  >
+                                    {m.path.split("/").pop()}
+                                  </a>
+                                )
+                              )}
+                            </div>
+                          </td>
+                        </tr>
+                      )}
+                    </Fragment>
+                  )
+                )}
+              </tbody>
+            </table>
+          </div>
+        )}
       </section>
 
       {showTask && (
@@ -641,15 +1244,68 @@ function Workspace() {
                 <tr>
                   <th>Task ID</th>
                   <th>Task</th>
+                  <th>Edit</th>
                 </tr>
               </thead>
               <tbody>
-                {taskRows.map((t) => (
-                  <tr key={t.id}>
-                    <td>{t.taskid}</td>
-                    <td className="cell-wrap">{t.task}</td>
-                  </tr>
-                ))}
+                {taskRows.map((t) =>
+                  editingTaskId === t.id ? (
+                    <tr key={t.id}>
+                      <td>
+                        <input
+                          value={taskEdit.taskid}
+                          onChange={(e) =>
+                            setTaskEdit((s) => ({
+                              ...s,
+                              taskid: e.target.value,
+                            }))
+                          }
+                        />
+                      </td>
+                      <td className="cell-wrap">
+                        <input
+                          value={taskEdit.task}
+                          onChange={(e) =>
+                            setTaskEdit((s) => ({ ...s, task: e.target.value }))
+                          }
+                        />
+                      </td>
+                      <td className="row-actions">
+                        <button
+                          type="button"
+                          className="submit-button"
+                          onClick={saveEditTask}
+                          disabled={savingTaskEdit}
+                        >
+                          {savingTaskEdit ? "Saving…" : "Save"}
+                        </button>
+                        <button
+                          type="button"
+                          className="link-button"
+                          onClick={cancelEditTask}
+                          disabled={savingTaskEdit}
+                        >
+                          Cancel
+                        </button>
+                      </td>
+                    </tr>
+                  ) : (
+                    <tr key={t.id}>
+                      <td>{t.taskid}</td>
+                      <td className="cell-wrap">{t.task}</td>
+                      <td className="row-actions">
+                        <button
+                          type="button"
+                          className="link-button"
+                          onClick={() => startEditTask(t)}
+                          disabled={editingTaskId !== null}
+                        >
+                          Edit
+                        </button>
+                      </td>
+                    </tr>
+                  )
+                )}
               </tbody>
             </table>
           </div>
@@ -710,16 +1366,83 @@ function Workspace() {
                   <th>Prime Sub</th>
                   <th>Model</th>
                   <th>Equipment</th>
+                  <th>Edit</th>
                 </tr>
               </thead>
               <tbody>
-                {equipmentRows.map((eq) => (
-                  <tr key={eq.id}>
-                    <td>{eq.primeSub}</td>
-                    <td>{eq.model}</td>
-                    <td>{eq.equipment}</td>
-                  </tr>
-                ))}
+                {equipmentRows.map((eq) =>
+                  editingEquipId === eq.id ? (
+                    <tr key={eq.id}>
+                      <td>
+                        <input
+                          value={equipEdit.primeSub}
+                          onChange={(e) =>
+                            setEquipEdit((s) => ({
+                              ...s,
+                              primeSub: e.target.value,
+                            }))
+                          }
+                        />
+                      </td>
+                      <td>
+                        <input
+                          value={equipEdit.model}
+                          onChange={(e) =>
+                            setEquipEdit((s) => ({
+                              ...s,
+                              model: e.target.value,
+                            }))
+                          }
+                        />
+                      </td>
+                      <td>
+                        <input
+                          value={equipEdit.equipment}
+                          onChange={(e) =>
+                            setEquipEdit((s) => ({
+                              ...s,
+                              equipment: e.target.value,
+                            }))
+                          }
+                        />
+                      </td>
+                      <td className="row-actions">
+                        <button
+                          type="button"
+                          className="submit-button"
+                          onClick={saveEditEquipment}
+                          disabled={savingEquipEdit}
+                        >
+                          {savingEquipEdit ? "Saving…" : "Save"}
+                        </button>
+                        <button
+                          type="button"
+                          className="link-button"
+                          onClick={cancelEditEquipment}
+                          disabled={savingEquipEdit}
+                        >
+                          Cancel
+                        </button>
+                      </td>
+                    </tr>
+                  ) : (
+                    <tr key={eq.id}>
+                      <td>{eq.primeSub}</td>
+                      <td>{eq.model}</td>
+                      <td>{eq.equipment}</td>
+                      <td className="row-actions">
+                        <button
+                          type="button"
+                          className="link-button"
+                          onClick={() => startEditEquipment(eq)}
+                          disabled={editingEquipId !== null}
+                        >
+                          Edit
+                        </button>
+                      </td>
+                    </tr>
+                  )
+                )}
               </tbody>
             </table>
           </div>
