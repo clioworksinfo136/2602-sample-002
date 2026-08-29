@@ -4,6 +4,9 @@ import { generateClient } from "aws-amplify/data";
 import { getUrl, remove, uploadData } from "aws-amplify/storage";
 import { Authenticator } from "@aws-amplify/ui-react";
 import "@aws-amplify/ui-react/styles.css";
+import miramarLogo from "./assets/miramar-logo.png";
+import jsPDF from "jspdf";
+import html2canvas from "html2canvas";
 
 const client = generateClient<Schema>();
 // The Date model requires a signed-in user (allow.authenticated()).
@@ -82,6 +85,63 @@ function mediaKind(path: string): MediaItem["kind"] {
   return "file";
 }
 
+// The Equipment field is a flat comma-separated list, so an inserted entry is
+// a run of several parts rather than a single one.
+function splitParts(value: string) {
+  return value
+    .split(",")
+    .map((p) => p.trim().toLowerCase())
+    .filter(Boolean);
+}
+
+// Is `addition` already in `current` as a contiguous run of parts?
+function hasParts(current: string, addition: string) {
+  const cur = splitParts(current);
+  const add = splitParts(addition);
+  if (add.length === 0) return false;
+  return cur.some((_, i) => add.every((a, j) => cur[i + j] === a));
+}
+
+// The Date model's `equipment` field is a flat comma-separated list written
+// three parts at a time, so it reads back as prime sub / model / description.
+function parseEquipmentRows(value: string) {
+  const parts = value
+    .split(",")
+    .map((v) => v.trim())
+    .filter(Boolean);
+  const rows: Array<{ primeSub: string; model: string; description: string }> =
+    [];
+  for (let i = 0; i < parts.length; i += 3) {
+    rows.push({
+      primeSub: parts[i] ?? "",
+      model: parts[i + 1] ?? "",
+      description: parts[i + 2] ?? "",
+    });
+  }
+  return rows;
+}
+
+// html2canvas re-requests images with crossOrigin set; the browser can answer
+// from a cached non-CORS response, which taints the canvas and makes the photo
+// render as an empty box. Inlining as data: URLs sidesteps CORS entirely.
+async function toDataUrl(url: string) {
+  const res = await fetch(url, { mode: "cors", cache: "reload" });
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  const blob = await res.blob();
+  return await new Promise<string>((resolve, reject) => {
+    const fr = new FileReader();
+    fr.onload = () => resolve(String(fr.result));
+    fr.onerror = () => reject(fr.error ?? new Error("read failed"));
+    fr.readAsDataURL(blob);
+  });
+}
+
+function weekdayOf(iso: string) {
+  return new Date(`${iso}T00:00:00`).toLocaleDateString("en-US", {
+    weekday: "long",
+  });
+}
+
 // list() returns a single page (100 rows by default), so follow nextToken to
 // be sure every saved row is loaded.
 async function listAll<T>(
@@ -98,23 +158,6 @@ async function listAll<T>(
     token = page.nextToken ?? undefined;
   } while (token);
   return all;
-}
-
-// The Equipment field is a flat comma-separated list, so an inserted entry is
-// a run of several parts rather than a single one.
-function splitParts(value: string) {
-  return value
-    .split(",")
-    .map((p) => p.trim().toLowerCase())
-    .filter(Boolean);
-}
-
-// Is `addition` already in `current` as a contiguous run of parts?
-function hasParts(current: string, addition: string) {
-  const cur = splitParts(current);
-  const add = splitParts(addition);
-  if (add.length === 0) return false;
-  return cur.some((_, i) => add.every((a, j) => cur[i + j] === a));
 }
 
 type CalendarProps = {
@@ -263,6 +306,11 @@ function Workspace() {
   // Signed URLs for the media keys held by the visible Location rows.
   const [mediaUrls, setMediaUrls] = useState<Record<string, MediaItem>>({});
   const [mediaError, setMediaError] = useState<string | null>(null);
+  // Off-screen report node that html2canvas rasterises for the PDF.
+  const reportRef = useRef<HTMLDivElement>(null);
+  const [exporting, setExporting] = useState(false);
+  // Photo key -> data: URL, populated only while a PDF is being produced.
+  const [reportImages, setReportImages] = useState<Record<string, string>>({});
   // Per-row attach: which Location row the hidden input is acting for.
   const rowInput = useRef<HTMLInputElement>(null);
   const rowTarget = useRef<string | null>(null);
@@ -407,23 +455,6 @@ function Workspace() {
   }, [loadDateDays, loadEntries, loadTasks, loadEquipment, loadLocations]);
 
 
-  // Equipment picker options, one per Equipment entry. Shown slash-separated;
-  // Insert writes the comma-separated form. Derived from the rows so edits
-  // and sorting flow through. Keyed by label so duplicates collapse.
-  const equipmentOptions = Array.from(
-    new Map(
-      equipmentRows
-        .map((eq) => {
-          const fields = [eq.primeSub, eq.model, eq.equipment]
-            .map((v) => v?.trim())
-            .filter((v): v is string => !!v);
-          return { label: fields.join(" / "), value: fields.join(", ") };
-        })
-        .filter((o) => o.label !== "")
-        .map((o) => [o.label, o] as const)
-    ).values()
-  );
-
   // The saved record for the selected date, if there is one. Drives Apply.
   const currentEntry = entries.find((d) => d.date === selected);
 
@@ -561,9 +592,22 @@ function Workspace() {
     }
   }
 
-  // The saved Location for this date and task. Drives the Description Apply.
-  const currentLocation = locationRows.find(
-    (l) => l.date === selected && (l.task ?? "") === form.task
+  // Equipment picker options, one per Equipment entry. Shown slash-separated;
+  // Insert writes the comma-separated form the report table parses. Derived
+  // from the rows so edits and sorting flow through; keyed by label so
+  // duplicates collapse.
+  const equipmentOptions = Array.from(
+    new Map(
+      equipmentRows
+        .map((eq) => {
+          const fields = [eq.primeSub, eq.model, eq.equipment]
+            .map((v) => v?.trim())
+            .filter((v): v is string => !!v);
+          return { label: fields.join(" / "), value: fields.join(", ") };
+        })
+        .filter((o) => o.label !== "")
+        .map((o) => [o.label, o] as const)
+    ).values()
   );
 
   const pickedOption = equipmentOptions.find((o) => o.label === equipPick);
@@ -586,6 +630,11 @@ function Workspace() {
           }
     );
   }
+
+  // The saved Location for this date and task. Drives the Description Apply.
+  const currentLocation = locationRows.find(
+    (l) => l.date === selected && (l.task ?? "") === form.task
+  );
 
   // Mirror the selected day's saved entry into the form inputs.
   // Days with no entry fall back to the blank/default form.
@@ -772,6 +821,182 @@ function Workspace() {
     }
   }
 
+  // Renders the off-screen report to a canvas, then slices it across A4 pages
+  // with a repeated header, the way the sample report is laid out.
+  async function exportPdf() {
+    const node = reportRef.current;
+    if (!node) return;
+    setExporting(true);
+    try {
+      // 1. Inline every photo as a data: URL so html2canvas never has to
+      //    re-fetch a cross-origin image (which silently yields blank boxes).
+      const keys = dayLocations
+        .flatMap((l) => attachmentsOf(l))
+        .filter((a) => mediaUrls[a.key]?.kind === "image")
+        .map((a) => a.key);
+      const inlined = await Promise.all(
+        keys.map(async (k) => {
+          try {
+            return [k, await toDataUrl(mediaUrls[k].url)] as const;
+          } catch {
+            return [k, ""] as const; // fall back to the signed URL
+          }
+        })
+      );
+      const failed = inlined.filter(([, v]) => !v).length;
+      setReportImages(Object.fromEntries(inlined.filter(([, v]) => v)));
+
+      // 2. Let React paint the swapped sources, then wait for decode.
+      await new Promise((r) => requestAnimationFrame(() => r(null)));
+      await new Promise((r) => requestAnimationFrame(() => r(null)));
+      await Promise.all(
+        Array.from(node.querySelectorAll("img")).map((im) =>
+          im.complete && im.naturalWidth
+            ? Promise.resolve()
+            : new Promise((r) => {
+                im.onload = () => r(null);
+                im.onerror = () => r(null);
+              })
+        )
+      );
+
+      const canvas = await html2canvas(node, {
+        scale: 2,
+        useCORS: true,
+        backgroundColor: "#ffffff",
+        logging: false,
+      });
+
+      const pdf = new jsPDF({ unit: "pt", format: "a4" });
+      const pageW = pdf.internal.pageSize.getWidth();
+      const pageH = pdf.internal.pageSize.getHeight();
+      const margin = 40;
+      const headerH = 92;
+      const contentW = pageW - margin * 2;
+      const contentH = pageH - headerH - margin;
+
+      // Pack whole sections onto pages: a section that will not fit in the
+      // space left moves to the next page rather than being cut in half.
+      const nodeW = node.offsetWidth || 800;
+      const ptPerCss = contentW / nodeW;
+      const scale = canvas.width / nodeW; // device px per CSS px
+      const pageCss = contentH / ptPerCss; // usable page height, in CSS px
+      const nodeTop = node.getBoundingClientRect().top;
+
+      const bounds = Array.from(
+        node.querySelectorAll<HTMLElement>(".report-block")
+      ).map((el) => {
+        const r = el.getBoundingClientRect();
+        return { top: r.top - nodeTop, bottom: r.bottom - nodeTop };
+      });
+      if (bounds.length === 0) {
+        bounds.push({ top: 0, bottom: canvas.height / scale });
+      }
+
+      const slices: Array<{ top: number; bottom: number }> = [];
+      let cursor = 0;
+      let i = 0;
+      while (i < bounds.length) {
+        let end = cursor;
+        let placed = 0;
+        while (i < bounds.length && bounds[i].bottom - cursor <= pageCss) {
+          end = bounds[i].bottom;
+          i++;
+          placed++;
+        }
+        if (placed === 0) {
+          // Single section taller than a page — it has to be split.
+          end = cursor + pageCss;
+          slices.push({ top: cursor, bottom: end });
+          cursor = end;
+          while (i < bounds.length && bounds[i].bottom <= cursor) i++;
+          continue;
+        }
+        slices.push({ top: cursor, bottom: end });
+        cursor = end;
+      }
+      const pageCount = slices.length;
+
+      const logo = new Image();
+      logo.src = miramarLogo;
+      await logo.decode().catch(() => undefined);
+
+      for (let pageIdx = 0; pageIdx < pageCount; pageIdx++) {
+        if (pageIdx > 0) pdf.addPage();
+
+        if (logo.complete && logo.naturalWidth) {
+          const lh = 38;
+          pdf.addImage(
+            logo,
+            "PNG",
+            margin,
+            28,
+            (logo.naturalWidth / logo.naturalHeight) * lh,
+            lh
+          );
+        }
+        pdf
+          .setFont("helvetica", "bold")
+          .setFontSize(13)
+          .setTextColor(31, 78, 121);
+        pdf.text("Daily Inspection Report", margin + 70, 44);
+        pdf.setFont("helvetica", "normal").setFontSize(9).setTextColor(70);
+        pdf.text(
+          `Date: ${selected}  |  ${dayLocations.length} task${
+            dayLocations.length === 1 ? "" : "s"
+          }`,
+          margin + 70,
+          58
+        );
+        pdf.setFontSize(8).setTextColor(120);
+        pdf.text(`Page ${pageIdx + 1} of ${pageCount}`, pageW - margin, 58, {
+          align: "right",
+        });
+        pdf
+          .setDrawColor(210)
+          .line(margin, headerH - 14, pageW - margin, headerH - 14);
+
+        const { top, bottom } = slices[pageIdx];
+        const srcY = Math.round(top * scale);
+        const srcH = Math.min(
+          Math.round((bottom - top) * scale),
+          canvas.height - srcY
+        );
+        if (srcH <= 0) continue;
+
+        const slice = document.createElement("canvas");
+        slice.width = canvas.width;
+        slice.height = srcH;
+        const ctx = slice.getContext("2d");
+        if (ctx) {
+          ctx.fillStyle = "#ffffff";
+          ctx.fillRect(0, 0, slice.width, slice.height);
+          ctx.drawImage(canvas, 0, -srcY);
+        }
+        pdf.addImage(
+          slice.toDataURL("image/jpeg", 0.92),
+          "JPEG",
+          margin,
+          headerH,
+          contentW,
+          (srcH / scale) * ptPerCss
+        );
+      }
+
+      pdf.save(`daily-report-${selected}.pdf`);
+      setMediaError(
+        failed > 0
+          ? `${failed} photo(s) could not be embedded; the rest exported.`
+          : null
+      );
+    } catch (err) {
+      setMediaError(`PDF export failed: ${errText(err)}`);
+    } finally {
+      setReportImages({});
+      setExporting(false);
+    }
+  }
+
   function startEditLocation(l: Schema["Location"]["type"]) {
     setEditingLocationId(l.id);
     setLocationEdit({
@@ -926,6 +1151,21 @@ function Workspace() {
         </label>
       </div>
 
+      <div className="project-header">
+        <h1 className="project-title">
+          Project: LS E-02 Rehabilitation (Project Number 8052)
+        </h1>
+        <button
+          type="button"
+          className="submit-button"
+          onClick={exportPdf}
+          disabled={exporting}
+          title={`Export a PDF of ${selected}`}
+        >
+          {exporting ? "Exporting…" : "Export PDF"}
+        </button>
+      </div>
+
       <section className="card">
         <div className="section-header">
           <h2 className="section-title">Date</h2>
@@ -1019,13 +1259,13 @@ function Workspace() {
               onChange={(e) => update("labor", e.target.value)}
             />
           </label>
-          </div>
-
           <label className="field field--equipment">
             <span>Equipment</span>
             <input
               value={form.equipment}
               onChange={(e) => update("equipment", e.target.value)}
+              placeholder="Prime, Model, Vac-Truck, Sub, Model, Backhoe"
+              title="Comma-separated in threes: prime/sub, model, description"
             />
             {/* Picker below the box: Insert appends it, Clear empties the box. */}
             <div className="input-with-action">
@@ -1063,6 +1303,8 @@ function Workspace() {
               </button>
             </div>
           </label>
+          </div>
+
 
           <div className="field field--observation">
             <span>Observation</span>
@@ -1729,6 +1971,127 @@ function Workspace() {
           </div>
         </div>
       )}
+
+      {/* Off-screen report that exportPdf() rasterises. Kept mounted so its
+          photos are already loaded when the button is pressed. */}
+      <div className="report" ref={reportRef}>
+        <div className="report-block">
+        <h2 className="report-title">
+          Daily Inspection Report &mdash; {selected} ({weekdayOf(selected)})
+        </h2>
+
+        <table className="report-info">
+          <tbody>
+            <tr>
+              <td className="k">PROJECT NAME/NO:</td>
+              <td className="v" colSpan={3}>
+                8052 - LS E-02 Rehabilitation
+              </td>
+            </tr>
+            <tr>
+              <td className="k">WEATHER CONDITION:</td>
+              <td className="v" colSpan={3}>
+                {form.weather || "—"}
+              </td>
+            </tr>
+            <tr>
+              <td className="k">HIGH TEMP:</td>
+              <td className="v">{form.hight || "—"}</td>
+              <td className="k">LOW TEMP:</td>
+              <td className="v">{form.lowt || "—"}</td>
+            </tr>
+            <tr>
+              <td className="k">SUPERVISOR:</td>
+              <td className="v">{form.supervisor || "—"}</td>
+              <td className="k">INSPECTOR:</td>
+              <td className="v">{form.inspector || "—"}</td>
+            </tr>
+            <tr>
+              <td className="k">NUMBER OF LABOR:</td>
+              <td className="v" colSpan={3}>
+                {form.labor || "—"}
+              </td>
+            </tr>
+          </tbody>
+        </table>
+        </div>
+
+        <div className="report-block">
+        <div className="report-band">CONTRACTOR&apos;S EQUIPMENT</div>
+        <table className="report-table">
+          <thead>
+            <tr>
+              <th>Prime/Sub</th>
+              <th>Model</th>
+              <th>Description</th>
+            </tr>
+          </thead>
+          <tbody>
+            {parseEquipmentRows(form.equipment).length === 0 ? (
+              <tr>
+                <td colSpan={3}>—</td>
+              </tr>
+            ) : (
+              parseEquipmentRows(form.equipment).map((r, i) => (
+                <tr key={i}>
+                  <td>{r.primeSub}</td>
+                  <td>{r.model}</td>
+                  <td>{r.description}</td>
+                </tr>
+              ))
+            )}
+          </tbody>
+        </table>
+        </div>
+
+        <div className="report-block">
+          <div className="report-band">CONSTRUCTION OBSERVATIONS</div>
+          <div className="report-text">{form.observation || "—"}</div>
+        </div>
+
+        {dayLocations.length === 0 ? (
+          <div className="report-block">
+            <div className="report-band">DETAILS</div>
+            <div className="report-text">—</div>
+          </div>
+        ) : (
+          dayLocations.map((l, idx) => (
+            <div key={l.id} className="report-block">
+              {idx === 0 && <div className="report-band">DETAILS</div>}
+              <div className="report-task">
+              <div className="report-task-name">
+                {l.task} &mdash; {l.phase}
+              </div>
+              <table className="report-info">
+                <tbody>
+                  <tr>
+                    <td className="k">DESCRIPTION</td>
+                    <td className="v">{l.description || "—"}</td>
+                  </tr>
+                </tbody>
+              </table>
+              {attachmentsOf(l).filter((a) => mediaUrls[a.key]).length > 0 && (
+                <div className="report-photos">
+                  {attachmentsOf(l)
+                    .filter((a) => mediaUrls[a.key]?.kind === "image")
+                    .map((a) => (
+                      <figure key={a.key}>
+                        <img
+                          src={reportImages[a.key] ?? mediaUrls[a.key].url}
+                          alt=""
+                          crossOrigin="anonymous"
+                        />
+                        {a.note && <figcaption>{a.note}</figcaption>}
+                      </figure>
+                    ))}
+                </div>
+              )}
+              </div>
+            </div>
+          ))
+        )}
+
+      </div>
     </main>
   );
 }
@@ -1739,6 +2102,11 @@ function App() {
       {({ signOut, user }) => (
         <div className="app-shell">
           <header className="app-bar">
+            <img
+              className="app-logo"
+              src={miramarLogo}
+              alt="City of Miramar — Beauty and Progress, est. 1955"
+            />
             <span className="app-user">{user?.signInDetails?.loginId}</span>
             <button type="button" className="link-button" onClick={signOut}>
               Sign out

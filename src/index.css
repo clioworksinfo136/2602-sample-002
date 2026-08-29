@@ -66,6 +66,25 @@ body {
   color: var(--muted);
 }
 
+/* Logo sits at the left of the header; margin-right pushes the rest right. */
+.app-logo {
+  /* 2.75rem x 1.6 x 1.6 */
+  height: 7.04rem;
+  width: auto;
+  margin-right: auto;
+  display: block;
+}
+
+/* The wordmark's lower text is dark and the PNG is transparent, so it needs a
+   light chip to stay legible on the dark theme. */
+@media (prefers-color-scheme: dark) {
+  .app-logo {
+    background: #fff;
+    padding: 0.25rem 0.5rem;
+    border-radius: 8px;
+  }
+}
+
 .app-user {
   font-weight: 500;
 }
@@ -105,6 +124,15 @@ main {
   justify-content: space-between;
   gap: 0.75rem;
   margin-bottom: 1rem;
+}
+
+/* Standing project heading above the Date card. */
+.project-title {
+  margin: 0;
+  font-size: 1.0625rem;
+  font-weight: 700;
+  letter-spacing: -0.01em;
+  color: var(--text);
 }
 
 .section-title {
@@ -809,4 +837,244 @@ button:disabled {
 
 .data-table tbody tr:last-child td {
   border-bottom: none;
+}
+
+
+/* ============ Print / Save as PDF ============
+   Applies when the browser prints (Ctrl+P / Save as PDF): everything
+   interactive is hidden so the page reads as a report, text stays selectable. */
+@media print {
+  @page {
+    size: letter portrait;
+    margin: 0.5in;
+  }
+
+  /* Print the photos and any tinted backgrounds, not just the text. */
+  * {
+    -webkit-print-color-adjust: exact !important;
+    print-color-adjust: exact !important;
+  }
+
+  body {
+    display: block;
+    padding: 0;
+    background: #fff;
+    color: #000;
+    font-size: 11pt;
+  }
+
+  .app-shell,
+  main {
+    max-width: none;
+    gap: 0.5rem;
+  }
+
+  /* Interactive chrome has no place in the report. */
+  .toggle-bar,
+  .app-bar .link-button,
+  .section-header .submit-button,
+  .input-with-action button,
+  .task-form,
+  .equipment-form,
+  .calendar-popover,
+  .date-trigger-caret,
+  .lightbox,
+  .data-table td.row-actions,
+  .data-table th:last-child {
+    display: none !important;
+  }
+
+  /* Show photos at a readable size. The thumbnail is a button on screen;
+     in print it is just a frame around the image. */
+  .media-grid {
+    gap: 0.5rem;
+  }
+
+  .media-thumb {
+    background: none !important;
+    border: none !important;
+    padding: 0 !important;
+  }
+
+  .media-item {
+    width: 2.4in;
+  }
+
+  .media-grid img,
+  .media-grid video {
+    width: 2.4in;
+    height: auto;
+    border: 1px solid #999;
+  }
+
+  .card {
+    border: 1px solid #bbb;
+    box-shadow: none;
+    padding: 0.5rem 0;
+    break-inside: avoid;
+  }
+
+  /* Inputs carry the data, so render them as plain text. */
+  input,
+  select,
+  textarea,
+  .date-trigger {
+    border: none !important;
+    background: transparent !important;
+    color: #000 !important;
+    padding-left: 0 !important;
+    box-shadow: none !important;
+    font-weight: 600;
+  }
+
+  textarea {
+    height: auto !important;
+    overflow: visible !important;
+  }
+
+  .data-table {
+    break-inside: auto;
+  }
+
+  .data-table tr {
+    break-inside: avoid;
+  }
+
+  .table-scroll {
+    overflow: visible !important;
+  }
+
+  .project-title {
+    font-size: 14pt;
+  }
+}
+
+/* ============ PDF report (rendered off-screen, rasterised by html2canvas) ==
+   Fixed 800px wide and always light-themed so the PDF looks the same
+   regardless of the viewer's screen or colour scheme. */
+.report {
+  position: fixed;
+  left: -10000px;
+  top: 0;
+  width: 800px;
+  padding: 0 0 12px;
+  background: #fff;
+  color: #1a1a1a;
+  font-family: Arial, Helvetica, sans-serif;
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.project-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+}
+
+.report-title {
+  margin: 0 0 10px;
+  font-size: 15px;
+  font-weight: 700;
+  color: #1f4e79;
+}
+
+.report-info,
+.report-table {
+  width: 100%;
+  border-collapse: collapse;
+  margin-bottom: 2px;
+}
+
+.report-info td {
+  border: 1px solid #d6dce5;
+  padding: 5px 8px;
+  vertical-align: top;
+}
+
+.report-info .k {
+  width: 22%;
+  font-weight: 700;
+  text-transform: uppercase;
+  font-size: 11px;
+  white-space: nowrap;
+}
+
+.report-info .v {
+  color: #1f4e79;
+}
+
+/* Blue section banner, as in the sample report. */
+.report-band {
+  margin-top: 8px;
+  padding: 4px 8px;
+  background: #dbe5f1;
+  border: 1px solid #c3d0e2;
+  font-weight: 700;
+  font-size: 12px;
+  text-transform: uppercase;
+  color: #1f4e79;
+}
+
+.report-text {
+  border: 1px solid #d6dce5;
+  border-top: none;
+  padding: 6px 8px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.report-task {
+  border: 1px solid #d6dce5;
+  border-top: none;
+  padding: 6px 8px;
+}
+
+.report-task-name {
+  font-weight: 700;
+  color: #1f4e79;
+  margin-bottom: 4px;
+}
+
+.report-task .report-info {
+  margin-bottom: 6px;
+}
+
+/* Two photos per row, so each one is large enough to read in the PDF. */
+.report-photos {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.report-photos figure {
+  margin: 0;
+  min-width: 0;
+}
+
+.report-photos img {
+  width: 100%;
+  height: auto;
+  border: 1px solid #b9c2cf;
+  display: block;
+}
+
+.report-photos figcaption {
+  font-size: 11px;
+  color: #444;
+  margin-top: 2px;
+  overflow-wrap: anywhere;
+}
+
+.report-table th,
+.report-table td {
+  border: 1px solid #d6dce5;
+  padding: 5px 8px;
+  text-align: left;
+  color: #1f4e79;
+}
+
+.report-table th {
+  background: #eef2f8;
+  font-weight: 700;
 }
