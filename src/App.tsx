@@ -309,6 +309,12 @@ function Workspace() {
   // Off-screen report node that html2canvas rasterises for the PDF.
   const reportRef = useRef<HTMLDivElement>(null);
   const [exporting, setExporting] = useState(false);
+  // "daily" is the normal workspace; "compare" swaps in the task x phase page.
+  const [view, setView] = useState<"daily" | "compare">(() =>
+    new URLSearchParams(window.location.search).get("view") === "compare"
+      ? "compare"
+      : "daily"
+  );
   // Photo key -> data: URL, populated only while a PDF is being produced.
   const [reportImages, setReportImages] = useState<Record<string, string>>({});
   // Per-row attach: which Location row the hidden input is acting for.
@@ -465,7 +471,21 @@ function Workspace() {
 
   // Media keys held by the rows on screen. Joined into a stable string so the
   // effect below re-runs only when the set of keys actually changes.
-  const visibleMediaKeys = dayLocations
+  // Compare page data: every Location grouped by task (rows) and phase (cols).
+  const compareTasks = Array.from(
+    new Set(locationRows.map((l) => l.task ?? "").filter(Boolean))
+  ).sort((a, b) => {
+    const ta = taskRows.find((t) => t.task === a)?.taskid ?? "";
+    const tb = taskRows.find((t) => t.task === b)?.taskid ?? "";
+    return (ta || a).localeCompare(tb || b);
+  });
+
+  const cellFor = (task: string, phase: string) =>
+    locationRows
+      .filter((l) => (l.task ?? "") === task && l.phase === phase)
+      .sort((a, b) => (a.date ?? "").localeCompare(b.date ?? ""));
+
+  const visibleMediaKeys = (view === "compare" ? locationRows : dayLocations)
     .flatMap((l) => attachmentsOf(l).map((a) => a.key))
     .join("|");
 
@@ -1128,6 +1148,214 @@ function Workspace() {
     }
   }
 
+  // The compare page replaces the workspace entirely rather than being spliced
+  // into it, so the daily page renders exactly as before.
+  // Shared by both views: the compare page early-returns before the daily
+  // markup, so the lightbox has to be rendered in each branch.
+  const lightbox =
+    viewer && viewerItem ? (
+        <div
+          className="lightbox"
+          role="dialog"
+          aria-modal="true"
+          onClick={() => setViewer(null)}
+        >
+          {/* Stop clicks inside the frame from closing the overlay. */}
+          <div className="lightbox-frame" onClick={(e) => e.stopPropagation()}>
+            <div className="lightbox-stage">
+              {viewerItem.kind === "video" ? (
+                <video src={viewerItem.url} controls autoPlay />
+              ) : viewerItem.kind === "image" ? (
+                <img src={viewerItem.url} alt="" />
+              ) : (
+                <a href={viewerItem.url} target="_blank" rel="noreferrer">
+                  {viewerItem.path.split("/").pop()}
+                </a>
+              )}
+
+              {count > 1 && (
+                <>
+                  <button
+                    type="button"
+                    className="lightbox-nav lightbox-nav--prev"
+                    onClick={() => stepViewer(-1)}
+                    aria-label="Previous"
+                  >
+                    &#8249;
+                  </button>
+                  <button
+                    type="button"
+                    className="lightbox-nav lightbox-nav--next"
+                    onClick={() => stepViewer(1)}
+                    aria-label="Next"
+                  >
+                    &#8250;
+                  </button>
+                </>
+              )}
+            </div>
+
+            <div className="lightbox-note">
+              <AutoGrowTextarea
+                value={noteDraft}
+                placeholder="Add a note for this photo…"
+                onChange={(e) => setNoteDraft(e.target.value)}
+              />
+              <button
+                type="button"
+                className="submit-button"
+                onClick={saveNote}
+                disabled={savingNote || noteDraft === viewerNote}
+              >
+                {savingNote ? "Saving…" : "Save note"}
+              </button>
+            </div>
+
+            <div className="lightbox-bar">
+              <span className="lightbox-count">
+                {viewer.index + 1} / {count}
+              </span>
+              <button
+                type="button"
+                className="submit-button danger-button"
+                onClick={deleteViewerMedia}
+                disabled={deletingMedia}
+              >
+                {deletingMedia ? "Deleting…" : "Delete photo"}
+              </button>
+              <button
+                type="button"
+                className="link-button"
+                onClick={() => setViewer(null)}
+                disabled={deletingMedia}
+              >
+                Close
+              </button>
+            </div>
+          </div>
+        </div>
+    ) : null;
+
+  // Leaving compare inside this tab also drops ?view=compare, so a refresh
+  // does not bounce back to the matrix.
+  function showDaily(date?: string) {
+    if (date) setSelected(date);
+    setView("daily");
+    const url = new URL(window.location.href);
+    url.searchParams.delete("view");
+    window.history.replaceState({}, "", url);
+  }
+
+  if (view === "compare") {
+    return (
+      <main>
+        <div className="project-header">
+          <h1 className="project-title">
+            Compare &mdash; Task × Phase
+          </h1>
+          <div className="project-actions">
+            <button
+              type="button"
+              className="link-button"
+              onClick={() => showDaily()}
+            >
+              &#8249; Back to daily report
+            </button>
+          </div>
+        </div>
+
+        <section className="card">
+          {compareTasks.length === 0 ? (
+            <p className="empty-note">No location entries recorded yet.</p>
+          ) : (
+            <div className="table-scroll">
+              <table className="data-table matrix">
+                <thead>
+                  <tr>
+                    <th className="matrix-corner">Task \ Phase</th>
+                    {PHASES.map((ph) => (
+                      <th key={ph}>{ph}</th>
+                    ))}
+                  </tr>
+                </thead>
+                <tbody>
+                  {compareTasks.map((task) => {
+                    const taskid = taskRows.find((t) => t.task === task)?.taskid;
+                    return (
+                      <tr key={task}>
+                        <th scope="row" className="matrix-row-head">
+                          {taskid ? `${taskid} — ${task}` : task}
+                        </th>
+                        {PHASES.map((ph) => {
+                          const cells = cellFor(task, ph);
+                          return (
+                            <td key={ph} className="matrix-cell">
+                              {cells.length === 0 ? (
+                                <span className="matrix-empty">&mdash;</span>
+                              ) : (
+                                cells.map((l) => (
+                                  <div key={l.id} className="matrix-entry">
+                                    <button
+                                      type="button"
+                                      className="matrix-date"
+                                      onClick={() => showDaily(l.date)}
+                                      title="Open this date in the daily report"
+                                    >
+                                      {l.date}
+                                    </button>
+                                    {l.description && (
+                                      <p className="matrix-desc">
+                                        {l.description}
+                                      </p>
+                                    )}
+                                    <div className="matrix-photos">
+                                      {attachmentsOf(l)
+                                        .map((a, i) => [a, i] as const)
+                                        .filter(
+                                          ([a]) =>
+                                            mediaUrls[a.key]?.kind === "image"
+                                        )
+                                        .map(([a, i]) => (
+                                          <button
+                                            key={a.key}
+                                            type="button"
+                                            className="media-thumb"
+                                            onClick={() =>
+                                              setViewer({
+                                                locationId: l.id,
+                                                index: i,
+                                              })
+                                            }
+                                            title={a.note || "Open"}
+                                          >
+                                            <img
+                                              src={mediaUrls[a.key].url}
+                                              alt={a.note}
+                                              loading="lazy"
+                                            />
+                                          </button>
+                                        ))}
+                                    </div>
+                                  </div>
+                                ))
+                              )}
+                            </td>
+                          );
+                        })}
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </section>
+
+        {lightbox}
+      </main>
+    );
+  }
+
   return (
     <main>
       <div className="toggle-bar">
@@ -1155,6 +1383,21 @@ function Workspace() {
         <h1 className="project-title">
           Project: LS E-02 Rehabilitation (Project Number 8052)
         </h1>
+        <div className="project-actions">
+        <button
+          type="button"
+          className="link-button"
+          onClick={() =>
+            window.open(
+              `${window.location.pathname}?view=compare`,
+              "_blank",
+              "noopener"
+            )
+          }
+          title="Opens the task × phase view in a new tab"
+        >
+          Compare
+        </button>
         <button
           type="button"
           className="submit-button"
@@ -1164,6 +1407,7 @@ function Workspace() {
         >
           {exporting ? "Exporting…" : "Export PDF"}
         </button>
+        </div>
       </div>
 
       <section className="card">
@@ -1889,88 +2133,7 @@ function Workspace() {
       </section>
       )}
 
-      {viewer && viewerItem && (
-        <div
-          className="lightbox"
-          role="dialog"
-          aria-modal="true"
-          onClick={() => setViewer(null)}
-        >
-          {/* Stop clicks inside the frame from closing the overlay. */}
-          <div className="lightbox-frame" onClick={(e) => e.stopPropagation()}>
-            <div className="lightbox-stage">
-              {viewerItem.kind === "video" ? (
-                <video src={viewerItem.url} controls autoPlay />
-              ) : viewerItem.kind === "image" ? (
-                <img src={viewerItem.url} alt="" />
-              ) : (
-                <a href={viewerItem.url} target="_blank" rel="noreferrer">
-                  {viewerItem.path.split("/").pop()}
-                </a>
-              )}
-
-              {count > 1 && (
-                <>
-                  <button
-                    type="button"
-                    className="lightbox-nav lightbox-nav--prev"
-                    onClick={() => stepViewer(-1)}
-                    aria-label="Previous"
-                  >
-                    &#8249;
-                  </button>
-                  <button
-                    type="button"
-                    className="lightbox-nav lightbox-nav--next"
-                    onClick={() => stepViewer(1)}
-                    aria-label="Next"
-                  >
-                    &#8250;
-                  </button>
-                </>
-              )}
-            </div>
-
-            <div className="lightbox-note">
-              <AutoGrowTextarea
-                value={noteDraft}
-                placeholder="Add a note for this photo…"
-                onChange={(e) => setNoteDraft(e.target.value)}
-              />
-              <button
-                type="button"
-                className="submit-button"
-                onClick={saveNote}
-                disabled={savingNote || noteDraft === viewerNote}
-              >
-                {savingNote ? "Saving…" : "Save note"}
-              </button>
-            </div>
-
-            <div className="lightbox-bar">
-              <span className="lightbox-count">
-                {viewer.index + 1} / {count}
-              </span>
-              <button
-                type="button"
-                className="submit-button danger-button"
-                onClick={deleteViewerMedia}
-                disabled={deletingMedia}
-              >
-                {deletingMedia ? "Deleting…" : "Delete photo"}
-              </button>
-              <button
-                type="button"
-                className="link-button"
-                onClick={() => setViewer(null)}
-                disabled={deletingMedia}
-              >
-                Close
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
+      {lightbox}
 
       {/* Off-screen report that exportPdf() rasterises. Kept mounted so its
           photos are already loaded when the button is pressed. */}
