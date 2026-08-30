@@ -255,11 +255,13 @@ button:disabled {
 }
 
 /* Line 2: Supervisor | Inspector (compact) | Labor (3-digit, minimal) | Equipment (fills the rest) */
+/* Top-aligned: the Equipment cell is taller because its picker sits under the
+   box, and bottom-aligning would lift its label and input above the others. */
 .form-row--2 {
   display: grid;
   grid-template-columns: 9rem 10.5rem 5rem minmax(0, 1fr);
   gap: 0.625rem;
-  align-items: end;
+  align-items: start;
 }
 
 /* Line 3 (Location): Task (fills the row) | Phase.
